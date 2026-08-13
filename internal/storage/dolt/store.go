@@ -792,6 +792,7 @@ var doltMetrics struct {
 	circuitRejected      metric.Int64Counter
 	serializationErrors  metric.Int64Counter
 	writeRetries         metric.Int64Counter
+	postTxCommitDropped  metric.Int64Counter
 	connAcquireMs        metric.Float64Histogram
 	poolWaitCount        metric.Int64Counter
 	poolWaitMs           metric.Float64Histogram
@@ -824,6 +825,10 @@ func init() {
 	doltMetrics.writeRetries, _ = m.Int64Counter("bd.write_retries_total",
 		metric.WithDescription("Write-tx retries in withRetryTx (label: type=serialization|connection)"),
 		metric.WithUnit("{retry}"),
+	)
+	doltMetrics.postTxCommitDropped, _ = m.Int64Counter("bd.db.post_tx_commit_dropped",
+		metric.WithDescription("Post-tx dolt commits abandoned after retries; the data landed but no dolt commit was minted (change rides the next commit on the branch)"),
+		metric.WithUnit("{commit}"),
 	)
 	doltMetrics.connAcquireMs, _ = m.Float64Histogram("bd.db.conn_acquire_ms",
 		metric.WithDescription("Time to acquire a pooled connection for a Dolt transaction"),
@@ -1005,6 +1010,16 @@ func (s *DoltStore) withReadTxLongTimeout(ctx context.Context, fn func(tx *sql.T
 	})
 }
 
+// withRetryTx runs fn in a write transaction, replaying the WHOLE body on
+// rollback-guaranteed conflicts (1213/1205 serialization, Dolt's exact 1105
+// autocommit rollback) and on pre-commit transient connection errors.
+//
+// Contract for closures: fn may run multiple times. Any state the closure
+// captures must be re-derived on EVERY attempt — unconditional assignment,
+// or an explicit reset at the top of the body when an assignment is
+// conditional — otherwise a rolled-back attempt's values leak into post-tx
+// logic (verify passes, hooks, return values). See ready_claimer.ClaimNext's
+// `claimed = nil` reset for the canonical example.
 func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = 25 * time.Millisecond
@@ -3000,8 +3015,22 @@ func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commi
 		}
 	}
 	if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-		return fmt.Errorf("dolt commit: %w", err)
+		commitMsg, s.commitAuthorString()); err != nil {
+		if !isDoltNothingToCommit(err) {
+			return fmt.Errorf("dolt commit: %w", err)
+		}
+		// Nothing-to-commit has three benign causes and the server cannot say
+		// which occurred: a no-op write (working set unchanged), absorption —
+		// sessions on one branch share the working set, so a concurrent
+		// writer's DOLT_COMMIT can sweep this operation's rows under ITS
+		// message — or a retried commit whose first attempt actually landed.
+		// The data is intact in every case; log neutrally (server mode only:
+		// embedded has no concurrent sessions and mostly hits the no-op case)
+		// so a missing audit line is explicable without asserting a
+		// concurrent writer that may not exist.
+		if s.serverMode {
+			log.Printf("dolt: commit %q made no dolt commit (nothing to commit): no-op write, change absorbed into a concurrent writer's commit, or an already-committed retry", commitMsg)
+		}
 	}
 	return nil
 }

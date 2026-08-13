@@ -3,8 +3,14 @@ package dolt
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/cenkalti/backoff/v4"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/storage/issueops"
@@ -319,6 +325,29 @@ func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string,
 	return s.doltAddAndCommitInTx(ctx, tx, permanentIssueAuxTables, fmt.Sprintf("bd: demote %s to wisp", id))
 }
 
+// doltAddAndCommitInTx stages and Dolt-commits INSIDE a still-open SQL
+// transaction.
+//
+// HAZARD (LatentLabsSpace/NEXUS#92): DOLT_ADD stages the whole table from
+// this session's BEGIN-time root, and DOLT_COMMIT here runs before the
+// transaction's commit-time merge — so under concurrent writers the produced
+// Dolt commit writes every concurrently-changed row in the staged tables
+// back to its BEGIN-time value (lost update). The main issue-mutation path
+// (runIssueOperationTxWithMessage) no longer uses this; it commits the SQL
+// transaction first and then calls doltAddAndCommitPostTx.
+//
+// The hazard remains LIVE everywhere the in-tx ordering survives — a larger
+// surface than this helper's callers: wisp promote/demote (this file),
+// legacy reopen (issues.go), RunInIssueLifecycleTransaction
+// (transaction.go), AND the same DOLT_ADD/DOLT_COMMIT-inside-tx pattern
+// inlined directly in the legacy DoltStore write methods in issues.go and
+// slots.go (UpdateIssue, UpdateIssueChecked, ClaimIssue, ClaimReadyIssue,
+// UnclaimIssue, UnclaimIssueIfAssignee, ReclaimExpiredLeases, CloseIssue*,
+// DeleteIssue*, MergeMetadata, SlotClear) — several reachable from live CLI
+// paths (bd edit/note/priority/defer/unclaim, linear sync) and from the
+// uow/domain claim surfaces. Every one of these should migrate to the
+// post-tx ordering; until then any of them racing a concurrent writer can
+// still silently revert that writer's committed rows.
 func (s *DoltStore) doltAddAndCommitInTx(ctx context.Context, tx *sql.Tx, tables []string, commitMsg string) error {
 	for _, table := range tables {
 		if err := schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table); err != nil {
@@ -330,6 +359,83 @@ func (s *DoltStore) doltAddAndCommitInTx(ctx context.Context, tx *sql.Tx, tables
 		return fmt.Errorf("dolt commit: %w", err)
 	}
 	return nil
+}
+
+const (
+	// postTxCommitMaxElapsed is deliberately short: the caller swallows the
+	// final error, so a long fight for a best-effort commit buys nothing and
+	// a stuck server (migration lock, read-only manifest) would otherwise
+	// stall EVERY mutation for the full outage. The 25ms initial interval
+	// mirrors withRetryTx's conflict tuning so routine 1213/1205 races retry
+	// promptly.
+	postTxCommitMaxElapsed = 5 * time.Second
+	// postTxCommitGrace pads the detached context past the backoff budget.
+	// The two bounds are NOT redundant: MaxElapsedTime only stops SCHEDULING
+	// further attempts, while the ctx deadline is the only thing that can
+	// cancel an attempt already hung in-flight (stuck server mid-statement).
+	postTxCommitGrace = 2 * time.Second
+)
+
+// doltAddAndCommitPostTx stages and Dolt-commits tables OUTSIDE any open SQL
+// transaction, against the session's current — post-merge — root. This is
+// the safe ordering for operations whose data transaction has already
+// committed: staging whole tables here cannot resurrect pre-transaction row
+// states, because the working set already reflects the commit-time merge
+// with concurrent writers (see runIssueOperationTxWithMessage).
+//
+// If this fails, the data change has still landed: it remains in the branch
+// working set and is carried into the next Dolt commit on the branch
+// (runIssueOperationTxWithMessage logs and swallows the failure for exactly
+// that reason — see the failure-mode note there).
+//
+// The retry classifier must accept everything withRetryTx retried when the
+// dolt commit still ran in-tx: transient connection errors plus Dolt's
+// rollback-guaranteed commit conflicts (1213/1205 serialization, 1105
+// autocommit rollback), which are routine under the concurrent-writer load
+// this path exists for. Retrying the whole sequence is safe: re-staging is
+// idempotent, and a replayed DOLT_COMMIT whose first attempt actually landed
+// degrades to nothing-to-commit, which doltAddAndCommit swallows. Plain
+// backoff, no circuit breaker: a failure here is benign to the data and must
+// not fail-fast unrelated operations.
+func (s *DoltStore) doltAddAndCommitPostTx(ctx context.Context, tables []string, commitMsg string) error {
+	// Detach from the caller's cancellation: the data transaction has already
+	// committed, so a request deadline or shutdown landing in this window
+	// must not deterministically skip the audit commit (values — tracing —
+	// are preserved). The commit gets its own budget instead.
+	ctx = context.WithoutCancel(ctx)
+	ctx, cancel := context.WithTimeout(ctx, postTxCommitMaxElapsed+postTxCommitGrace)
+	defer cancel()
+
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = 25 * time.Millisecond
+	bo.MaxElapsedTime = postTxCommitMaxElapsed
+	var lastErr error
+	err := backoff.Retry(func() error {
+		err := s.doltAddAndCommit(ctx, tables, commitMsg)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		// Mirror withRetryTx's accounting so conflict pressure on this path
+		// stays visible to the same counters that tracked it in-tx.
+		if isSerializationError(err) || isDoltAutocommitRollbackError(err) {
+			doltMetrics.serializationErrors.Add(ctx, 1)
+			doltMetrics.writeRetries.Add(ctx, 1, metric.WithAttributes(attribute.String("type", "serialization")))
+			return err
+		}
+		if isRetryableError(err) {
+			doltMetrics.writeRetries.Add(ctx, 1, metric.WithAttributes(attribute.String("type", "connection")))
+			return err
+		}
+		return backoff.Permanent(err)
+	}, backoff.WithContext(bo, ctx))
+	if err != nil && lastErr != nil && !errors.Is(err, lastErr) {
+		// backoff.Retry returns the bare ctx error when the deadline expires
+		// mid-sleep, discarding the last real Dolt failure — the only
+		// diagnostic for a swallowed audit commit. Keep both.
+		return fmt.Errorf("%w (last attempt: %w)", err, lastErr)
+	}
+	return err
 }
 
 // getAllWispDependencyRecords returns all wisp dependency records, keyed by issue_id.
