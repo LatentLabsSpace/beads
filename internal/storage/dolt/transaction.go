@@ -72,17 +72,22 @@ func (s *DoltStore) RunInTransaction(ctx context.Context, commitMsg string, fn f
 // RunInIssueLifecycleTransaction runs a lifecycle transition and its durable
 // side effects through one SQL transaction and one Dolt commit attempt.
 func (s *DoltStore) RunInIssueLifecycleTransaction(ctx context.Context, commitMsg string, fn func(tx storage.IssueLifecycleTransaction) error) error {
-	return s.withRetryTx(ctx, func(sqlTx *sql.Tx) error {
+	var staged []string
+	if err := s.withRetryTx(ctx, func(sqlTx *sql.Tx) error {
+		staged = nil
 		tx := &doltTransaction{regularTx: sqlTx, ignoredTx: sqlTx, store: s, lifecycle: true}
 		if err := fn(tx); err != nil {
 			return err
 		}
-		tables := tx.dirtyTableNames()
-		if len(tables) == 0 {
-			return nil
-		}
-		return s.doltAddAndCommitInTx(ctx, sqlTx, tables, commitMsg)
-	})
+		staged = tx.dirtyTableNames()
+		return nil
+	}); err != nil {
+		return err
+	}
+	// Post-tx Dolt commit (NEXUS#92 ordering): stages the post-merge state
+	// of exactly the tables the body dirtied.
+	s.doltCommitAfterTx(ctx, staged, commitMsg)
+	return nil
 }
 
 func (t *doltTransaction) dirtyTableNames() []string {

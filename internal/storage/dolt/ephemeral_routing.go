@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -14,7 +15,6 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/storage/issueops"
-	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -208,13 +208,17 @@ func (s *DoltStore) PartitionWispIDs(ctx context.Context, ids []string) (wispIDs
 // redirect label/dependency/event writes back to wisp tables.
 func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor string) error {
 	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
-		if err := issueops.PromoteFromEphemeralInTx(ctx, tx, id, actor); err != nil {
-			return err
-		}
-		return s.doltAddAndCommitInTx(ctx, tx, permanentIssueAuxTables, fmt.Sprintf("bd: promote %s", id))
+		return issueops.PromoteFromEphemeralInTx(ctx, tx, id, actor)
 	}); err != nil {
 		return err
 	}
+	// Post-tx Dolt commit (NEXUS#92 ordering): the in-tx form staged the
+	// whole issues table from the BEGIN-time root, so a promote racing any
+	// concurrent claim/update silently reverted the other writer's rows —
+	// the exact mechanism behind holodeck's hd-gws working-set stomps
+	// (Gas City wisp patrol driving this path on a timer).
+	s.doltCommitAfterTx(ctx, permanentIssueAuxTables,
+		fmt.Sprintf("bd: promote %s", id))
 	return nil
 }
 
@@ -226,9 +230,16 @@ func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor s
 //
 // Called by UpdateIssue when no_history=true or wisp=true is set on a regular issue.
 func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
 		return s.demoteToWispInTx(ctx, tx, id, updates, actor)
-	})
+	}); err != nil {
+		return err
+	}
+	// Post-tx Dolt commit (NEXUS#92 ordering); demoteToWispInTx no longer
+	// commits in-tx, its callers own this tail.
+	s.doltCommitAfterTx(ctx, permanentIssueAuxTables,
+		fmt.Sprintf("bd: demote %s to wisp", id))
+	return nil
 }
 
 // demoteToWispInTx is DemoteToWisp's transaction body: it applies the field
@@ -322,43 +333,48 @@ func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string,
 		return fmt.Errorf("recompute is_blocked after demote for %s: %w", id, err)
 	}
 
-	return s.doltAddAndCommitInTx(ctx, tx, permanentIssueAuxTables, fmt.Sprintf("bd: demote %s to wisp", id))
+	// No Dolt commit here (NEXUS#92 ordering): the transaction is still
+	// open, so staging would re-materialize the BEGIN-time table. Both
+	// callers (DemoteToWisp, UpdateIssueChecked's demote branch) run
+	// doltCommitAfterTx(permanentIssueAuxTables, "bd: demote <id> to wisp")
+	// after their transaction wrapper commits.
+	return nil
 }
 
-// doltAddAndCommitInTx stages and Dolt-commits INSIDE a still-open SQL
-// transaction.
+// HISTORY (LatentLabsSpace/NEXUS#92): a doltAddAndCommitInTx helper used to
+// live here, staging and Dolt-committing INSIDE the still-open SQL
+// transaction. DOLT_ADD stages the whole table from the session's
+// BEGIN-time root, and a DOLT_COMMIT before the transaction's commit-time
+// merge writes every concurrently-changed row in the staged tables back to
+// its BEGIN-time value — silent lost updates under any concurrency
+// (observed in production twice: holodeck hd-dhm via the main issue
+// mutation path, then hd-gws via Gas City's wisp patrol driving promote/
+// demote on a timer). Every write path now commits the SQL transaction
+// first and stages the post-merge state via doltCommitAfterTx below; the
+// in-tx helper is deleted so the ordering cannot be reintroduced by
+// reaching for an existing function. If a new write path needs a Dolt
+// commit, capture (tables, message) in the transaction body and call
+// doltCommitAfterTx after the wrapper returns nil — never CALL DOLT_ADD /
+// DOLT_COMMIT on a *sql.Tx.
 //
-// HAZARD (LatentLabsSpace/NEXUS#92): DOLT_ADD stages the whole table from
-// this session's BEGIN-time root, and DOLT_COMMIT here runs before the
-// transaction's commit-time merge — so under concurrent writers the produced
-// Dolt commit writes every concurrently-changed row in the staged tables
-// back to its BEGIN-time value (lost update). The main issue-mutation path
-// (runIssueOperationTxWithMessage) no longer uses this; it commits the SQL
-// transaction first and then calls doltAddAndCommitPostTx.
-//
-// The hazard remains LIVE everywhere the in-tx ordering survives — a larger
-// surface than this helper's callers: wisp promote/demote (this file),
-// legacy reopen (issues.go), RunInIssueLifecycleTransaction
-// (transaction.go), AND the same DOLT_ADD/DOLT_COMMIT-inside-tx pattern
-// inlined directly in the legacy DoltStore write methods in issues.go and
-// slots.go (UpdateIssue, UpdateIssueChecked, ClaimIssue, ClaimReadyIssue,
-// UnclaimIssue, UnclaimIssueIfAssignee, ReclaimExpiredLeases, CloseIssue*,
-// DeleteIssue*, MergeMetadata, SlotClear) — several reachable from live CLI
-// paths (bd edit/note/priority/defer/unclaim, linear sync) and from the
-// uow/domain claim surfaces. Every one of these should migrate to the
-// post-tx ordering; until then any of them racing a concurrent writer can
-// still silently revert that writer's committed rows.
-func (s *DoltStore) doltAddAndCommitInTx(ctx context.Context, tx *sql.Tx, tables []string, commitMsg string) error {
-	for _, table := range tables {
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table); err != nil {
-			return fmt.Errorf("dolt add %s: %w", table, err)
-		}
+// doltCommitAfterTx is the standard tail for a write migrated off the in-tx
+// ordering (LatentLabsSpace/NEXUS#92): after the SQL transaction has
+// committed, stage exactly the tables the body dirtied and mint the Dolt
+// commit from the post-merge state — which cannot resurrect stale rows.
+// Failure is logged, never propagated: the mutation is durable and the
+// change rides the next Dolt commit on the branch (same contract, same
+// reasoning as runIssueOperationTxWithMessage). Callers capture the staged
+// tables and message inside their transaction body (resetting per retry
+// attempt) and call this only after the transaction wrapper returns nil;
+// nil/empty tables is a no-op so conditional captures need no guard.
+func (s *DoltStore) doltCommitAfterTx(ctx context.Context, tables []string, commitMsg string) {
+	if len(tables) == 0 {
+		return
 	}
-	if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-		return fmt.Errorf("dolt commit: %w", err)
+	if err := s.doltAddAndCommitPostTx(ctx, tables, commitMsg); err != nil {
+		doltMetrics.postTxCommitDropped.Add(ctx, 1)
+		log.Printf("dolt: post-tx dolt commit failed for %q (data already committed; change rides the next dolt commit): %v", commitMsg, err)
 	}
-	return nil
 }
 
 const (
