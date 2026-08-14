@@ -7,7 +7,6 @@ import (
 	"fmt"
 
 	"github.com/steveyegge/beads/internal/storage/issueops"
-	"github.com/steveyegge/beads/internal/storage/schema"
 )
 
 // MergeMetadata merges a single key into an issue's metadata JSON atomically.
@@ -33,24 +32,17 @@ func (s *DoltStore) MergeMetadata(ctx context.Context, issueID, key string, valu
 	// withRetryTx owns BeginTx and the final Commit. The read+merge+write inside
 	// the fn is a single transaction; the retry is what fixes the cross-tx
 	// clobber the old SlotSet suffered from.
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-		if err := issueops.MergeMetadataInTx(ctx, tx, issueID, key, value, actor); err != nil {
-			return err
-		}
-
-		// Dolt versioning for permanent issues. The merge routes through
-		// UpdateIssueInTx, which also writes an EventUpdated row into events, so
-		// stage both tables before committing (mirrors CloseIssue).
-		for _, table := range []string{"issues", "events"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
-		commitMsg := fmt.Sprintf("bd: merge metadata %s.%s", issueID, key)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
-	})
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		return issueops.MergeMetadataInTx(ctx, tx, issueID, key, value, actor)
+	}); err != nil {
+		return err
+	}
+	// Post-tx Dolt commit (NEXUS#92 ordering). The merge routes through
+	// UpdateIssueInTx, which also writes an EventUpdated row into events,
+	// so stage both tables (mirrors CloseIssue).
+	s.doltCommitAfterTx(ctx, []string{"issues", "events"},
+		fmt.Sprintf("bd: merge metadata %s.%s", issueID, key))
+	return nil
 }
 
 // mergeMetadataWisp merges a metadata key on a wisp. Mirrors closeWisp: no Dolt
@@ -134,24 +126,17 @@ func (s *DoltStore) SlotClear(ctx context.Context, issueID, key, actor string) e
 		return s.clearMetadataWisp(ctx, issueID, key, actor)
 	}
 
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-		if err := issueops.DeleteMetadataInTx(ctx, tx, issueID, key, actor); err != nil {
-			return err
-		}
-
-		// DeleteMetadataInTx routes through UpdateIssueInTx (issues + events),
-		// so stage both before committing. A no-op clear writes nothing, which
-		// DOLT_COMMIT reports as nothing-to-commit (handled below).
-		for _, table := range []string{"issues", "events"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
-		commitMsg := fmt.Sprintf("bd: clear metadata %s.%s", issueID, key)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
-	})
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		return issueops.DeleteMetadataInTx(ctx, tx, issueID, key, actor)
+	}); err != nil {
+		return err
+	}
+	// Post-tx Dolt commit (NEXUS#92 ordering). DeleteMetadataInTx routes
+	// through UpdateIssueInTx (issues + events); a no-op clear degrades to
+	// nothing-to-commit inside the helper.
+	s.doltCommitAfterTx(ctx, []string{"issues", "events"},
+		fmt.Sprintf("bd: clear metadata %s.%s", issueID, key))
+	return nil
 }
 
 // clearMetadataWisp clears a metadata key on a wisp. Mirrors mergeMetadataWisp /

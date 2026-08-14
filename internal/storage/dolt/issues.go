@@ -16,7 +16,6 @@ import (
 	"github.com/steveyegge/beads/internal/idgen"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
-	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -207,8 +206,13 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 	// retried rather than surfaced as a hard failure. Dolt has no real row
 	// locking — FOR UPDATE / SKIP LOCKED are parse-only no-ops
 	// (https://www.dolthub.com/blog/2023-10-23-hold-my-beer/) — so retry is the
-	// only safety net. withRetryTx owns BeginTx and the final Commit.
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+	// only safety net. withRetryTx owns BeginTx and the final Commit; the Dolt
+	// commit runs after it per the NEXUS#92 ordering contract (see
+	// runIssueOperationTxWithMessage).
+	var staged []string
+	var commitMsg string
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		staged, commitMsg = nil, ""
 		result, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor)
 		if err != nil {
 			return err
@@ -216,17 +220,13 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 		if !result.Changed {
 			return nil
 		}
-
-		for _, table := range []string{"issues", "events"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
-		commitMsg := fmt.Sprintf("bd: update %s", id)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
+		staged, commitMsg = []string{"issues", "events"}, fmt.Sprintf("bd: update %s", id)
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	s.doltCommitAfterTx(ctx, staged, commitMsg)
+	return nil
 }
 
 // UpdateIssueChecked applies the update like UpdateIssue, adding an optional
@@ -258,7 +258,7 @@ func (s *DoltStore) UpdateIssueChecked(ctx context.Context, id string, updates m
 	_, settingNoHistory := updates["no_history"]
 	_, settingWisp := updates["wisp"]
 	if settingNoHistory || settingWisp {
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
 			if err := checkExpectedVersionInTx(ctx, tx, id, opts.ExpectedVersion); err != nil {
 				return err
 			}
@@ -266,7 +266,14 @@ func (s *DoltStore) UpdateIssueChecked(ctx context.Context, id string, updates m
 				return err
 			}
 			return s.demoteToWispInTx(ctx, tx, id, updates, actor)
-		})
+		}); err != nil {
+			return err
+		}
+		// Post-tx Dolt commit (NEXUS#92 ordering); demoteToWispInTx no
+		// longer commits in-tx, its callers own this tail.
+		s.doltCommitAfterTx(ctx, permanentIssueAuxTables,
+			fmt.Sprintf("bd: demote %s to wisp", id))
+		return nil
 	}
 
 	// Wrap in withRetryTx exactly like UpdateIssue so a concurrent writer that
@@ -280,7 +287,10 @@ func (s *DoltStore) UpdateIssueChecked(ctx context.Context, id string, updates m
 	// and is replayed by withRetryTx, which re-reads the preconditions here and
 	// refuses. withRetryTx owns BeginTx and the final Commit.
 	write := func() error {
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		var staged []string
+		var commitMsg string
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			staged, commitMsg = nil, ""
 			if err := checkExpectedVersionInTx(ctx, tx, id, opts.ExpectedVersion); err != nil {
 				return err
 			}
@@ -294,17 +304,13 @@ func (s *DoltStore) UpdateIssueChecked(ctx context.Context, id string, updates m
 			if !result.Changed {
 				return nil
 			}
-
-			for _, table := range []string{"issues", "events"} {
-				_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-			}
-			commitMsg := fmt.Sprintf("bd: update %s", id)
-			if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-				return fmt.Errorf("dolt commit: %w", err)
-			}
+			staged, commitMsg = []string{"issues", "events"}, fmt.Sprintf("bd: update %s", id)
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
+		s.doltCommitAfterTx(ctx, staged, commitMsg)
+		return nil
 	}
 
 	// A guarded update that writes the coordination fields (a reassign or a
@@ -341,23 +347,19 @@ func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) err
 	// The whole write is then resolved by verify-by-re-read (bd-zccb9): under a
 	// degraded server the exit status is not truth in either direction.
 	return s.verifiedClaimWrite(ctx, id, claimedBy(actor), func() error {
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-			if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor); err != nil {
-				return err
-			}
-
-			// Dolt versioning for permanent issues.
-			// GH#2455: Stage only the tables we modified, then commit without -A.
-			for _, table := range []string{"issues", "events"} {
-				_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-			}
-			commitMsg := fmt.Sprintf("bd: claim %s", id)
-			if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-				return fmt.Errorf("dolt commit: %w", err)
-			}
-			return nil
-		})
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			_, err := issueops.ClaimIssueInTx(ctx, tx, id, actor)
+			return err
+		}); err != nil {
+			return err
+		}
+		// Post-tx Dolt commit (NEXUS#92 ordering): stages the post-merge
+		// state, so a concurrent claimant's committed row can no longer be
+		// reverted by this claim's Dolt commit. Inside the write closure so
+		// a verify-triggered replay re-commits its own attempt.
+		s.doltCommitAfterTx(ctx, []string{"issues", "events"},
+			fmt.Sprintf("bd: claim %s", id))
+		return nil
 	})
 }
 
@@ -375,23 +377,17 @@ func (s *DoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter
 		err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
 			var err error
 			claimed, err = issueops.ClaimReadyIssueInTx(ctx, tx, filter, actor)
-			if err != nil {
-				return err
-			}
-			if claimed == nil {
-				return nil
-			}
-
-			for _, table := range []string{"issues", "events"} {
-				_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-			}
-			commitMsg := fmt.Sprintf("bd: claim ready %s", claimed.ID)
-			if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-				return fmt.Errorf("dolt commit: %w", err)
-			}
-			return nil
+			return err
 		})
+		// Post-tx Dolt commit (NEXUS#92 ordering). Only on definite success:
+		// an errCommitPhase must reach verifiedReadyClaim without a Dolt
+		// commit attempt — staging the shared working set on an ambiguous
+		// outcome could mint a commit of a concurrent writer's pending rows
+		// under this operation's message.
+		if err == nil && claimed != nil {
+			s.doltCommitAfterTx(ctx, []string{"issues", "events"},
+				fmt.Sprintf("bd: claim ready %s", claimed.ID))
+		}
 		return claimed, err
 	}
 	return s.verifiedReadyClaim(ctx, actor, write)
@@ -497,24 +493,15 @@ func (s *DoltStore) ReclaimExpiredLeases(ctx context.Context, olderThan time.Dur
 	err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
 		var err error
 		reclaimed, err = issueops.ReclaimExpiredLeasesInTx(ctx, tx, cutoff, filter, actor)
-		if err != nil {
-			return err
-		}
-		if len(reclaimed) == 0 {
-			return nil
-		}
-		for _, table := range []string{"issues", "events"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
-		commitMsg := fmt.Sprintf("bd: reclaim %d expired lease(s)", len(reclaimed))
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
+		return err
 	})
 	if err != nil {
 		return nil, err
+	}
+	if len(reclaimed) > 0 {
+		// Post-tx Dolt commit (NEXUS#92 ordering).
+		s.doltCommitAfterTx(ctx, []string{"issues", "events"},
+			fmt.Sprintf("bd: reclaim %d expired lease(s)", len(reclaimed)))
 	}
 	return reclaimed, nil
 }
@@ -532,22 +519,16 @@ func (s *DoltStore) UnclaimIssue(ctx context.Context, id string, actor string, f
 	// verify-by-re-read (bd-zccb9): a phantom unclaim leaves the caller
 	// believing the issue is released while it still holds the claim.
 	return s.verifiedClaimWrite(ctx, id, unclaimed(), func() error {
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-			if err := issueops.UnclaimIssueInTx(ctx, tx, id, actor, force); err != nil {
-				return err
-			}
-
-			// Dolt versioning for permanent issues.
-			for _, table := range []string{"issues", "events"} {
-				_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-			}
-			commitMsg := fmt.Sprintf("bd: unclaim %s", id)
-			if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-				return fmt.Errorf("dolt commit: %w", err)
-			}
-			return nil
-		})
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			return issueops.UnclaimIssueInTx(ctx, tx, id, actor, force)
+		}); err != nil {
+			return err
+		}
+		// Post-tx Dolt commit (NEXUS#92 ordering); inside the write closure
+		// so a verify-triggered replay re-commits its own attempt.
+		s.doltCommitAfterTx(ctx, []string{"issues", "events"},
+			fmt.Sprintf("bd: unclaim %s", id))
+		return nil
 	})
 }
 
@@ -561,29 +542,25 @@ func (s *DoltStore) UnclaimIssue(ctx context.Context, id string, actor string, f
 func (s *DoltStore) UnclaimIssueIfAssignee(ctx context.Context, id string, actor string, expectedAssignee string) error {
 	// verify-by-re-read (bd-zccb9), same reasoning as UnclaimIssue.
 	return s.verifiedClaimWrite(ctx, id, unclaimed(), func() error {
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-			if err := issueops.UnclaimIssueIfAssigneeInTx(ctx, tx, id, actor, expectedAssignee); err != nil {
-				return err
-			}
-
-			// Dolt versioning for permanent issues.
-			for _, table := range []string{"issues", "events"} {
-				_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-			}
-			commitMsg := fmt.Sprintf("bd: unclaim %s", id)
-			if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-				return fmt.Errorf("dolt commit: %w", err)
-			}
-			return nil
-		})
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			return issueops.UnclaimIssueIfAssigneeInTx(ctx, tx, id, actor, expectedAssignee)
+		}); err != nil {
+			return err
+		}
+		// Post-tx Dolt commit (NEXUS#92 ordering); inside the write closure
+		// so a verify-triggered replay re-commits its own attempt.
+		s.doltCommitAfterTx(ctx, []string{"issues", "events"},
+			fmt.Sprintf("bd: unclaim %s", id))
+		return nil
 	})
 }
 
 // ReopenIssue reopens a done-category issue atomically and stages only the
 // versioned tables that this transaction concretely changed.
 func (s *DoltStore) ReopenIssue(ctx context.Context, id string, reason string, actor string) error {
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+	var staged []string
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		staged = nil
 		res, err := issueops.ReopenIssueInTx(ctx, tx, id, reason, actor)
 		if err != nil {
 			return err
@@ -593,13 +570,18 @@ func (s *DoltStore) ReopenIssue(ctx context.Context, id string, reason string, a
 		}
 		switch {
 		case !res.IsWisp:
-			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, fmt.Sprintf("bd: reopen %s", id))
+			staged = []string{"issues", "events"}
 		case res.IssueRowsChanged:
-			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues"}, fmt.Sprintf("bd: reopen %s", id))
-		default:
-			return nil
+			staged = []string{"issues"}
 		}
-	})
+		return nil
+	}); err != nil {
+		return err
+	}
+	// Post-tx Dolt commit (NEXUS#92 ordering); nil staged (wisp with no
+	// permanent rows touched, or no change) skips it.
+	s.doltCommitAfterTx(ctx, staged, fmt.Sprintf("bd: reopen %s", id))
+	return nil
 }
 
 // UpdateIssueType changes the issue_type field of an issue.
@@ -624,23 +606,16 @@ func (s *DoltStore) CloseIssue(ctx context.Context, id string, reason string, ac
 	// locking — FOR UPDATE / SKIP LOCKED are parse-only no-ops
 	// (https://www.dolthub.com/blog/2023-10-23-hold-my-beer/) — so retry is the
 	// only safety net. withRetryTx owns BeginTx and the final Commit.
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-		if _, err := issueops.CloseIssueInTx(ctx, tx, id, reason, actor, session); err != nil {
-			return err
-		}
-
-		// Dolt versioning for permanent issues.
-		// GH#2455: Stage only the tables we modified, then commit without -A.
-		for _, table := range []string{"issues", "events"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
-		commitMsg := fmt.Sprintf("bd: close %s", id)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
-	})
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		_, err := issueops.CloseIssueInTx(ctx, tx, id, reason, actor, session)
+		return err
+	}); err != nil {
+		return err
+	}
+	// Post-tx Dolt commit (NEXUS#92 ordering).
+	s.doltCommitAfterTx(ctx, []string{"issues", "events"},
+		fmt.Sprintf("bd: close %s", id))
+	return nil
 }
 
 // CloseIssueChecked closes an issue but refuses with storage.ErrCloseBlocked
@@ -670,21 +645,14 @@ func (s *DoltStore) CloseIssueChecked(ctx context.Context, id string, actor stri
 			return err
 		}
 		result = storage.CloseIssueResult{Unchanged: res.AlreadyClosed, OpenChildren: res.OpenChildren}
-
-		// Dolt versioning for permanent issues.
-		// GH#2455: Stage only the tables we modified, then commit without -A.
-		for _, table := range []string{"issues", "events"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
-		commitMsg := fmt.Sprintf("bd: close %s", id)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
 		return nil
 	}); err != nil {
 		return storage.CloseIssueResult{}, err
 	}
+	// Post-tx Dolt commit (NEXUS#92 ordering); an already-closed no-op
+	// degrades to nothing-to-commit inside the helper.
+	s.doltCommitAfterTx(ctx, []string{"issues", "events"},
+		fmt.Sprintf("bd: close %s", id))
 	return result, nil
 }
 
@@ -696,22 +664,14 @@ func (s *DoltStore) DeleteIssue(ctx context.Context, id string) error {
 	}
 
 	if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
-		if err := issueops.DeleteIssueInTx(ctx, tx, id); err != nil {
-			return err
-		}
-
-		for _, table := range []string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
-		commitMsg := fmt.Sprintf("bd: delete %s", id)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
+		return issueops.DeleteIssueInTx(ctx, tx, id)
 	}); err != nil {
 		return err
 	}
+	// Post-tx Dolt commit (NEXUS#92 ordering).
+	s.doltCommitAfterTx(ctx,
+		[]string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"},
+		fmt.Sprintf("bd: delete %s", id))
 	return nil
 }
 
@@ -768,25 +728,14 @@ func (s *DoltStore) DeleteIssues(ctx context.Context, ids []string, cascade bool
 	var result *types.DeleteIssuesResult
 	if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		r, err := issueops.DeleteIssuesInTx(ctx, tx, ids, cascade, force, dryRun)
-		if err != nil {
-			result = r
-			return err
-		}
 		result = r
-		if dryRun {
-			return nil
-		}
-
-		for _, table := range []string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"} {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
-		commitMsg := fmt.Sprintf("bd: delete %d issue(s)", result.DeletedCount)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
-	}); err != nil {
+		return err
+	}); err == nil && !dryRun {
+		// Post-tx Dolt commit (NEXUS#92 ordering).
+		s.doltCommitAfterTx(ctx,
+			[]string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"},
+			fmt.Sprintf("bd: delete %d issue(s)", result.DeletedCount))
+	} else if err != nil {
 		// Preserve partial result (e.g., OrphanedIssues) on error.
 		if result != nil {
 			result.DeletedCount += wispDeleteCount
