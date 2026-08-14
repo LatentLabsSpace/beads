@@ -1,0 +1,69 @@
+name: Claude Code Review
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  claude-review:
+    # Only fire on PR comments (not plain issues) containing the trigger phrase.
+    # Note: issue_comment workflows always run the version of this file on the
+    # DEFAULT branch — which must be nexus/main for this to fire at all (the
+    # `main` mirror stays byte-pure upstream; only the default-branch SETTING
+    # points at nexus/main). Edits here take effect after merge to nexus/main.
+    # Public-repo guard (unlike the private NEXUS original): only repo
+    # owners/members/collaborators may trigger a paid review run — a
+    # drive-by "/review" comment from anyone else is ignored.
+    if: |
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/review') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          ref: refs/pull/${{ github.event.issue.number }}/head
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          # The trailing instruction asks the reviewer to emit a machine-readable
+          # verdict trailer. pr-status.sh (lib/review-verdict.sh) parses it as the
+          # AUTHORITATIVE, format-proof signal of blockers/nits. If the plugin
+          # ever omits it, the classifier falls back to header detection and then
+          # fails SAFE (verdict=unread) — so this is an optimization, not a
+          # correctness dependency.
+          prompt: |
+            /code-review:code-review ${{ github.repository }}/pull/${{ github.event.issue.number }}
+
+            After completing the review, append EXACTLY ONE trailer line as the
+            very last line of your review comment, in this precise format (tooling
+            parses it; do not wrap it in code fences):
+            <!-- review-verdict: blockers=<N> nits=<M> -->
+            where <N> = count of High/Medium/Critical-priority findings you
+            reported and <M> = count of Low-priority/nit findings. If you reported
+            none, emit blockers=0 nits=0.
+          # Ignore the repo's .claude/settings.json — its allow/deny lists
+          # are tuned for the local devcontainer and caused the action's
+          # MCP comment-posting tools to be denied (silent green checks
+          # with permission_denials_count > 0 and no PR comments).
+          settings: '{"settingSources": ["user"]}'
+          # Sticky progress comment + job-summary report so we can see
+          # what Claude said instead of just a silent green check.
+          track_progress: 'true'
+          display_report: 'true'
+          # Default to Sonnet for routine reviews (Opus 4.7 was ~$2.80/PR).
+          claude_args: '--model claude-sonnet-5'
