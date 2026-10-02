@@ -14,7 +14,6 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/storage/issueops"
-	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -207,14 +206,18 @@ func (s *DoltStore) PartitionWispIDs(ctx context.Context, ids []string) (wispIDs
 // Uses direct SQL inserts to bypass IsEphemeralID routing, which would otherwise
 // redirect label/dependency/event writes back to wisp tables.
 func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor string) error {
+	var pc postTxCommit
 	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		if err := issueops.PromoteFromEphemeralInTx(ctx, tx, id, actor); err != nil {
 			return err
 		}
-		return s.doltAddAndCommitInTx(ctx, tx, permanentIssueAuxTables, fmt.Sprintf("bd: promote %s", id))
+		pc.stage(permanentIssueAuxTables, fmt.Sprintf("bd: promote %s", id))
+		return nil
 	}); err != nil {
 		return err
 	}
+	s.publishPostTx(ctx, pc)
 	return nil
 }
 
@@ -226,18 +229,24 @@ func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor s
 //
 // Called by UpdateIssue when no_history=true or wisp=true is set on a regular issue.
 func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-		return s.demoteToWispInTx(ctx, tx, id, updates, actor)
-	})
+	var pc postTxCommit
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
+		return s.demoteToWispInTx(ctx, tx, id, updates, actor, &pc)
+	}); err != nil {
+		return err
+	}
+	s.publishPostTx(ctx, pc)
+	return nil
 }
 
 // demoteToWispInTx is DemoteToWisp's transaction body: it applies the field
 // update without an intermediate event, then migrates the issue to the wisps
 // table (insert into wisps, copy auxiliary rows, delete from issues) and stages
-// the demotion commit. Extracted so UpdateIssueChecked can wrap it with an
-// atomic version precondition in the same transaction; DemoteToWisp's behavior
-// is unchanged.
-func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string) error {
+// the demotion commit into pc — the caller publishes it after the SQL commit
+// (NEXUS#92 ordering). Extracted so UpdateIssueChecked can wrap it with an
+// atomic version precondition in the same transaction.
+func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string, pc *postTxCommit) error {
 	if _, err := issueops.UpdateIssueWithoutEventInTx(ctx, tx, id, updates, actor); err != nil {
 		return fmt.Errorf("update issue before demotion: %w", err)
 	}
@@ -331,71 +340,19 @@ func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string,
 		return err
 	}
 
-	return s.doltAddAndCommitInTx(ctx, tx, permanentIssueAuxTables, fmt.Sprintf("bd: demote %s to wisp", id))
-}
-
-// doltAddAndCommitInTx stages and Dolt-commits INSIDE a still-open SQL
-// transaction.
-//
-// HAZARD (LatentLabsSpace/NEXUS#92): DOLT_ADD stages the whole table from
-// this session's BEGIN-time root, and DOLT_COMMIT here runs before the
-// transaction's commit-time merge — so under concurrent writers the produced
-// Dolt commit writes every concurrently-changed row in the staged tables
-// back to its BEGIN-time value (lost update). The main issue-mutation path
-// (runIssueOperationTxWithMessage) no longer uses this; it commits the SQL
-// transaction first and then calls doltAddAndCommitPostTx.
-//
-// The hazard remains LIVE everywhere the in-tx ordering survives — a larger
-// surface than this helper's callers: wisp promote/demote (this file),
-// legacy reopen (issues.go), RunInIssueLifecycleTransaction
-// (transaction.go), AND the same DOLT_ADD/DOLT_COMMIT-inside-tx pattern
-// inlined directly in the legacy DoltStore write methods in issues.go and
-// slots.go (UpdateIssue, UpdateIssueChecked, ClaimIssue, ClaimReadyIssue,
-// UnclaimIssue, UnclaimIssueIfAssignee, ReclaimExpiredLeases, CloseIssue*,
-// DeleteIssue*, MergeMetadata, SlotClear) — several reachable from live CLI
-// paths (bd edit/note/priority/defer/unclaim, linear sync) and from the
-// uow/domain claim surfaces. Every one of these should migrate to the
-// post-tx ordering; until then any of them racing a concurrent writer can
-// still silently revert that writer's committed rows.
-func (s *DoltStore) doltAddAndCommitInTx(ctx context.Context, tx *sql.Tx, tables []string, commitMsg string) error {
-	// Batch/off auto-commit (bd-4wamg): leave the writes in the working set
-	// for a later explicit commit point (bd dolt commit / CommitPending)
-	// instead of minting one Dolt version commit per write.
-	if issueops.VersionCommitDeferred(ctx) {
-		return nil
-	}
-	for _, table := range tables {
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table); err != nil {
-			return fmt.Errorf("dolt add %s: %w", table, err)
-		}
-	}
-
-	// Skip the commit when nothing was actually staged. A caller can reach here
-	// after an idempotent no-op write (e.g. re-adding an existing dependency via
-	// INSERT IGNORE, or removing a non-existent one), in which case the DOLT_ADDs
-	// above stage nothing and DOLT_COMMIT('-m') fails with a server-side "nothing
-	// to commit" warning that floods the Dolt log at reconcile cadence.
-	//
-	// Unlike StageAndCommit's fast-path (a global HasPendingChanges check), this
-	// helper stages only a FIXED table list. Other tables may be dirty
-	// concurrently, so the guard must test the STAGED set, not the whole working
-	// set — otherwise we would still fire an empty `-m` commit whenever an
-	// unrelated table is dirty. issueops.HasStagedChanges checks exactly what
-	// '-m' will commit; *sql.Tx satisfies issueops.SQLQuerier.
-	staged, err := issueops.HasStagedChanges(ctx, tx)
-	if err != nil {
-		return fmt.Errorf("check staged changes before commit: %w", err)
-	}
-	if !staged {
-		return nil
-	}
-
-	if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-		return wrapSQLCommitError("dolt commit", err)
-	}
+	pc.stage(permanentIssueAuxTables, fmt.Sprintf("bd: demote %s to wisp", id))
 	return nil
 }
+
+// doltAddAndCommitInTx was DELETED (LatentLabsSpace fork, completing the
+// NEXUS#92 migration upstream began in #5740/#6040): it staged and
+// Dolt-committed INSIDE a still-open SQL transaction, building the Dolt commit
+// from the session's BEGIN-time root before the commit-time merge, so under
+// concurrent writers every concurrently-changed row in the staged tables was
+// written back to its BEGIN-time value (lost update — production: wisp
+// promote/demote reverting claims, holodeck hd-gws). Every former caller now
+// stages a postTxCommit inside its transaction body and publishes it via
+// publishPostTx after the SQL commit. Do not reintroduce an in-tx variant.
 
 const (
 	// postTxCommitMaxElapsed is deliberately short: the caller swallows the

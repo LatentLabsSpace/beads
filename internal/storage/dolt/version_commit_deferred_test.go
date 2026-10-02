@@ -12,7 +12,8 @@ import (
 // the Dolt working set — no per-write version commit — until an explicit
 // commit point flushes them (CommitPending / bd dolt commit). This is the
 // server-mode half of --dolt-auto-commit batch/off; the CLI sets the context
-// in issueOpsContext, and this store honors it in doltAddAndCommitInTx.
+// in issueOpsContext, and this store honors it in doltAddAndCommit (the
+// post-tx publisher every versioned write routes through).
 func TestDeferredVersionCommitLeavesWritesForCommitPending(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -58,7 +59,7 @@ func TestDeferredVersionCommitLeavesWritesForCommitPending(t *testing.T) {
 }
 
 // TestDeferredVersionCommitUpdatePath covers the update verb's commit site
-// (RunInIssueLifecycleTransaction -> doltAddAndCommitInTx) under deferral.
+// (RunInIssueLifecycleTransaction -> publishPostTx) under deferral.
 func TestDeferredVersionCommitUpdatePath(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()

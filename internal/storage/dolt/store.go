@@ -1266,16 +1266,20 @@ func (s *DoltStore) recheckBlockedAfterCommit(ctx context.Context, pending issue
 	}
 	ctx, cancel := issueops.BlockedRecheckContext(ctx)
 	defer cancel()
+	var pc postTxCommit
 	err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		result, err := issueops.RecomputeIsBlockedInTxWithResult(ctx, tx, pending.IssueIDs, pending.WispIDs)
 		if err != nil || !result.IssueRowsChanged {
 			return err
 		}
-		return s.doltAddAndCommitInTx(ctx, tx, []string{"issues"}, pending.CommitMessage())
+		pc.stage([]string{"issues"}, pending.CommitMessage())
+		return nil
 	})
 	if err != nil {
 		return issueops.BlockedRecheckFailed(err)
 	}
+	s.publishPostTx(ctx, pc)
 	return nil
 }
 
@@ -3597,8 +3601,9 @@ func (s *DoltStore) CommitAll(ctx context.Context, message string) (bool, error)
 // indeterminate durable outcome and must not be replayed.
 func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commitMsg string) error {
 	// Batch/off auto-commit (bd-4wamg): leave the writes in the working set
-	// for a later explicit commit point (bd dolt commit / CommitPending),
-	// matching doltAddAndCommitInTx.
+	// for a later explicit commit point (bd dolt commit / CommitPending).
+	// Every post-tx publication (publishPostTx) routes through here, so this
+	// is the single deferral point for all versioned writes.
 	if issueops.VersionCommitDeferred(ctx) {
 		return nil
 	}

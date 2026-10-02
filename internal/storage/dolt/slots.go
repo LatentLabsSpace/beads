@@ -33,17 +33,23 @@ func (s *DoltStore) MergeMetadata(ctx context.Context, issueID, key string, valu
 		// withRetryTx owns BeginTx and the final Commit. The read+merge+write inside
 		// the fn is a single transaction; the retry is what fixes the cross-tx
 		// clobber the old SlotSet suffered from.
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		var pc postTxCommit
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			pc = postTxCommit{}
 			if err := issueops.MergeMetadataInTx(ctx, tx, issueID, key, value, actor); err != nil {
 				return err
 			}
 
 			// Dolt versioning for permanent issues. The merge routes through
 			// UpdateIssueInTx, which also writes an EventUpdated row into events, so
-			// stage both tables before committing (mirrors CloseIssue).
-			commitMsg := fmt.Sprintf("bd: merge metadata %s.%s", issueID, key)
-			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
-		})
+			// stage both tables, committed after the SQL commit (mirrors CloseIssue).
+			pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: merge metadata %s.%s", issueID, key))
+			return nil
+		}); err != nil {
+			return err
+		}
+		s.publishPostTx(ctx, pc)
+		return nil
 	})
 }
 
@@ -135,17 +141,23 @@ func (s *DoltStore) SlotClear(ctx context.Context, issueID, key, actor string) e
 			return s.clearMetadataWisp(ctx, issueID, key, actor)
 		}
 
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		var pc postTxCommit
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			pc = postTxCommit{}
 			if err := issueops.DeleteMetadataInTx(ctx, tx, issueID, key, actor); err != nil {
 				return err
 			}
 
 			// DeleteMetadataInTx routes through UpdateIssueInTx (issues + events),
-			// so stage both before committing. A no-op clear writes nothing, which
-			// DOLT_COMMIT reports as nothing-to-commit (handled by the helper).
-			commitMsg := fmt.Sprintf("bd: clear metadata %s.%s", issueID, key)
-			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
-		})
+			// so stage both. A no-op clear writes nothing, which the post-tx
+			// staged-set guard skips (nothing to commit).
+			pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: clear metadata %s.%s", issueID, key))
+			return nil
+		}); err != nil {
+			return err
+		}
+		s.publishPostTx(ctx, pc)
+		return nil
 	})
 }
 

@@ -7,7 +7,6 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	storeops "github.com/steveyegge/beads/internal/storage/issueops"
-	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/workapi"
 	"github.com/steveyegge/beads/issueops"
 )
@@ -41,13 +40,16 @@ var _ issueops.Sweeper = (*sweeper)(nil)
 // giving it a write transaction and an empty commit would make the preview
 // look like a mutation to everything watching the store.
 //
-// THE VERSION-CONTROL ENTRY IS ONE PER SWEEP, recorded here rather than in the
-// shared body because the two backends mint it differently: this one INSIDE
-// the write transaction, where the embedded store can only publish after its
-// SQL commit, on a second connection. That is why the role promises exactly
-// one entry in the STEADY STATE and only this leg makes it atomic with the
-// sweep. An ephemeral sweep touches only the wisp tables, which this plane
-// ignores, so DOLT_COMMIT finds nothing to commit and records none.
+// THE VERSION-CONTROL ENTRY IS ONE PER SWEEP, published AFTER the SQL commit
+// (LatentLabsSpace/NEXUS#92 ordering). It used to be minted INSIDE the write
+// transaction to make the entry atomic with the sweep — but an in-tx
+// DOLT_ADD stages whole tables from the BEGIN-time root, so a sweep racing
+// any concurrent writer wrote that writer's committed rows back to their
+// BEGIN-time values. A sweep's data correctness for OTHER writers outranks
+// the atomicity of its own audit entry: if the trailing commit fails, the
+// sweep is durable and rides the next Dolt commit (publishPostTx contract).
+// An ephemeral sweep touches only the wisp tables, which this plane ignores,
+// so the post-tx staged-set guard finds nothing to commit and records none.
 func (s *sweeper) Sweep(ctx context.Context, req issueops.SweepRequest) (issueops.SweepResult, error) {
 	if err := workapi.ValidateSweepRequest(req); err != nil {
 		return issueops.SweepResult{}, err
@@ -66,25 +68,21 @@ func (s *sweeper) Sweep(ctx context.Context, req issueops.SweepRequest) (issueop
 		return result, nil
 	}
 
+	var pc postTxCommit
 	if err := s.store.withWriteTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		if err := run(tx); err != nil {
 			return err
 		}
 		if result.Swept == 0 {
 			return nil
 		}
-		for _, table := range sweptTables {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
-		msg := fmt.Sprintf("bd: sweep %d %s bead(s)", result.Swept, req.Tier)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			msg, s.store.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
+		pc.stage(sweptTables, fmt.Sprintf("bd: sweep %d %s bead(s)", result.Swept, req.Tier))
 		return nil
 	}); err != nil {
 		return issueops.SweepResult{}, err
 	}
+	s.store.publishPostTx(ctx, pc)
 	return result, nil
 }
 

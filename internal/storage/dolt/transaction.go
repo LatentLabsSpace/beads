@@ -122,19 +122,25 @@ func (s *DoltStore) runInIssueLifecycleTransaction(
 	return s.withTransactionSetupRetry(ctx, func() error {
 		invoked := false
 		var callbackErr error
+		var pc postTxCommit
 		err := run(ctx, func(sqlTx *sql.Tx) error {
 			invoked = true
+			pc = postTxCommit{}
 			tx := &doltTransaction{regularTx: sqlTx, ignoredTx: sqlTx, store: s}
 			if callbackErr = fn(tx); callbackErr != nil {
 				return callbackErr
 			}
-			tables := tx.dirtyTableNames()
-			if len(tables) == 0 {
-				return nil
+			if tables := tx.dirtyTableNames(); len(tables) > 0 {
+				pc.stage(tables, commitMsg)
 			}
-			return s.doltAddAndCommitInTx(ctx, sqlTx, tables, commitMsg)
+			return nil
 		})
-		if invoked && err != nil {
+		if err == nil {
+			// Published once, after the SQL commit (NEXUS#92 ordering).
+			s.publishPostTx(ctx, pc)
+			return nil
+		}
+		if invoked {
 			// An ambiguous commit reaches withRetry so connection failures still
 			// count toward the circuit breaker, but it is never replayed.
 			if callbackErr == nil && errors.Is(err, ErrCommitIndeterminate) {

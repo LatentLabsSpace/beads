@@ -45,7 +45,7 @@ var _ issueops.MetadataCAS = (*metadataCAS)(nil)
 //
 // THE VERSION-CONTROL ENTRY IS ONE PER SWAP THAT WROTE. A lost race and a swap
 // over an already-equal value stage nothing, and an ephemeral row's tables are
-// ignored by this plane, so the staged-set guard inside doltAddAndCommitInTx
+// ignored by this plane, so the staged-set guard inside doltAddAndCommit
 // finds nothing to commit and records none — which is why this leg needs no
 // separate wisp path.
 func (m *metadataCAS) CompareAndSetKey(ctx context.Context, req issueops.CompareAndSetKeyRequest) (issueops.CompareAndSetKeyResult, error) {
@@ -55,7 +55,9 @@ func (m *metadataCAS) CompareAndSetKey(ctx context.Context, req issueops.Compare
 	}
 
 	var result issueops.CompareAndSetKeyResult
+	var pc postTxCommit
 	if err := m.store.withRetryTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		swap, write, err := storeops.CompareAndSetMetadataKeyInTx(ctx, tx, plan)
 		if err != nil {
 			return err
@@ -69,10 +71,12 @@ func (m *metadataCAS) CompareAndSetKey(ctx context.Context, req issueops.Compare
 		}
 		// The swap routes through UpdateIssueInTx, which also writes an
 		// EventUpdated row, so stage both tables (mirrors MergeMetadata).
-		return m.store.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"},
+		pc.stage([]string{"issues", "events"},
 			fmt.Sprintf("bd: compare-and-set metadata %s.%s", plan.IssueID, plan.Key))
+		return nil
 	}); err != nil {
 		return issueops.CompareAndSetKeyResult{}, err
 	}
+	m.store.publishPostTx(ctx, pc)
 	return result, nil
 }

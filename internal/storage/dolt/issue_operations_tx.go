@@ -82,22 +82,51 @@ func (s *DoltStore) runIssueOperationTxWithMessage(ctx context.Context, fn func(
 		// resolves the true outcome.
 		return err
 	}
-	staged := sortedDirtyTables(tables)
-	if len(staged) == 0 {
-		return nil
+	s.publishPostTx(ctx, postTxCommit{tables: sortedDirtyTables(tables), msg: commitMsg})
+	return nil
+}
+
+// postTxCommit is a Dolt version commit composed inside a transaction body and
+// published only AFTER the SQL transaction commits (LatentLabsSpace/NEXUS#92
+// ordering — see runIssueOperationTxWithMessage for why the in-tx ordering
+// loses concurrent writers' rows). Bodies run under withRetryTx and may be
+// replayed, so every body resets its postTxCommit before doing any work: a
+// retried attempt must never inherit the commit a rolled-back attempt staged.
+// The zero value publishes nothing.
+type postTxCommit struct {
+	tables []string
+	msg    string
+}
+
+// stage records the commit to publish once the SQL transaction commits. Plain
+// assignment (never append) so a replayed body overwrites, not accumulates.
+func (p *postTxCommit) stage(tables []string, msg string) {
+	p.tables, p.msg = tables, msg
+}
+
+// publishPostTx publishes a staged postTxCommit after its SQL transaction has
+// committed. Call it only when the transaction returned nil: on any error —
+// including ErrCommitIndeterminate — no commit may be attempted (see the
+// ambiguity note in runIssueOperationTxWithMessage).
+//
+// Failure contract (identical to runIssueOperationTxWithMessage, which routes
+// through here): a failed history commit is logged and counted
+// (bd.db.post_tx_commit_dropped), NEVER propagated — the mutation is applied
+// and durable and rides the next Dolt commit on the branch; surfacing an error
+// would make callers treat an applied mutation as failed and double-apply.
+func (s *DoltStore) publishPostTx(ctx context.Context, p postTxCommit) {
+	if len(p.tables) == 0 {
+		return
 	}
+	commitMsg := p.msg
 	if commitMsg == "" {
 		// A body can dirty tables without composing a message (e.g. a ready
 		// claim whose side effects landed but which claimed nothing); never
 		// mint a Dolt commit with an empty message.
 		commitMsg = "bd: issue operation"
 	}
-	if err := s.doltAddAndCommitPostTx(ctx, staged, commitMsg); err != nil {
-		// See the failure-mode note above: the mutation is applied and
-		// durable; only the trailing history commit is missing, and the
-		// change rides the next dolt commit on the branch.
+	if err := s.doltAddAndCommitPostTx(ctx, p.tables, commitMsg); err != nil {
 		doltMetrics.postTxCommitDropped.Add(ctx, 1)
 		log.Printf("dolt: post-tx dolt commit failed for %q (data already committed; change rides the next dolt commit): %v", commitMsg, err)
 	}
-	return nil
 }

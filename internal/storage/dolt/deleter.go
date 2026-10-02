@@ -7,7 +7,6 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	storeops "github.com/steveyegge/beads/internal/storage/issueops"
-	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/workapi"
 	"github.com/steveyegge/beads/issueops"
 )
@@ -43,13 +42,12 @@ var _ issueops.Deleter = (*deleter)(nil)
 // giving it a write transaction and an empty commit would make a preview look
 // like a mutation to everything watching the store.
 //
-// THE VERSION-CONTROL ENTRY IS ONE PER DELETION, recorded here rather than in
-// the shared body because the two backends mint it differently: this one
-// INSIDE the write transaction, where the embedded store can only publish
-// after its SQL commit, on a second connection. That is why the role promises
-// exactly one entry in the STEADY STATE and only this leg makes it atomic with
-// the deletion. A deletion confined to the wisp tables touches only tables
-// this plane ignores, so DOLT_COMMIT finds nothing to commit and records none.
+// THE VERSION-CONTROL ENTRY IS ONE PER DELETION, published AFTER the SQL
+// commit (LatentLabsSpace/NEXUS#92 ordering — see Sweep, its twin, for why
+// data correctness for concurrent writers outranks the audit entry's
+// atomicity with the deletion). A deletion confined to the wisp tables touches
+// only tables this plane ignores, so the post-tx staged-set guard finds
+// nothing to commit and records none.
 func (s *deleter) Delete(ctx context.Context, req issueops.DeleteRequest) (issueops.DeleteResult, error) {
 	if err := workapi.ValidateDeleteRequest(req); err != nil {
 		return issueops.DeleteResult{}, err
@@ -69,31 +67,24 @@ func (s *deleter) Delete(ctx context.Context, req issueops.DeleteRequest) (issue
 		return result, nil
 	}
 
+	var pc postTxCommit
 	if err := s.store.withWriteTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		if err := run(tx); err != nil {
 			return err
 		}
 		if result.Deleted == 0 {
 			return nil
 		}
-		// Batch/off auto-commit (bd-4wamg): defer the version commit to an
-		// explicit commit point, matching doltAddAndCommitInTx.
-		if storeops.VersionCommitDeferred(ctx) {
-			return nil
-		}
 		// The same tables a sweep stages; the neighbor rewrite lands in
-		// `issues`, which is already on the list.
-		for _, table := range sweptTables {
-			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
-		}
-		msg := fmt.Sprintf("bd: delete %d issue(s)", result.Deleted)
-		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			msg, s.store.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
+		// `issues`, which is already on the list. Published after the SQL
+		// commit (NEXUS#92 ordering); batch/off auto-commit deferral
+		// (bd-4wamg) is honored inside the post-tx publisher.
+		pc.stage(sweptTables, fmt.Sprintf("bd: delete %d issue(s)", result.Deleted))
 		return nil
 	}); err != nil {
 		return issueops.DeleteResult{}, err
 	}
+	s.store.publishPostTx(ctx, pc)
 	return result, nil
 }

@@ -225,7 +225,9 @@ func (s *DoltStore) updateIssue(ctx context.Context, id string, updates map[stri
 	// locking — FOR UPDATE / SKIP LOCKED are parse-only no-ops
 	// (https://www.dolthub.com/blog/2023-10-23-hold-my-beer/) — so retry is the
 	// only safety net. withRetryTx owns BeginTx and the final Commit.
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+	var pc postTxCommit
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		result, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor)
 		if err != nil {
 			return err
@@ -233,10 +235,13 @@ func (s *DoltStore) updateIssue(ctx context.Context, id string, updates map[stri
 		if !result.Changed {
 			return nil
 		}
-
-		commitMsg := fmt.Sprintf("bd: update %s", id)
-		return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
-	})
+		pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: update %s", id))
+		return nil
+	}); err != nil {
+		return err
+	}
+	s.publishPostTx(ctx, pc)
+	return nil
 }
 
 // UpdateIssueChecked applies the update like UpdateIssue, adding an optional
@@ -274,15 +279,21 @@ func (s *DoltStore) updateIssueChecked(ctx context.Context, id string, updates m
 	_, settingNoHistory := updates["no_history"]
 	_, settingWisp := updates["wisp"]
 	if settingNoHistory || settingWisp {
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		var pc postTxCommit
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			pc = postTxCommit{}
 			if err := checkExpectedVersionInTx(ctx, tx, id, opts.ExpectedVersion); err != nil {
 				return err
 			}
 			if err := issueops.CheckExpectedFieldsInTx(ctx, tx, id, opts.ExpectedAssignee, opts.ExpectedStatus); err != nil {
 				return err
 			}
-			return s.demoteToWispInTx(ctx, tx, id, updates, actor)
-		})
+			return s.demoteToWispInTx(ctx, tx, id, updates, actor, &pc)
+		}); err != nil {
+			return err
+		}
+		s.publishPostTx(ctx, pc)
+		return nil
 	}
 
 	// Wrap in withRetryTx exactly like UpdateIssue so a concurrent writer that
@@ -296,7 +307,9 @@ func (s *DoltStore) updateIssueChecked(ctx context.Context, id string, updates m
 	// and is replayed by withRetryTx, which re-reads the preconditions here and
 	// refuses. withRetryTx owns BeginTx and the final Commit.
 	write := func() error {
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		var pc postTxCommit
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			pc = postTxCommit{}
 			if err := checkExpectedVersionInTx(ctx, tx, id, opts.ExpectedVersion); err != nil {
 				return err
 			}
@@ -310,10 +323,13 @@ func (s *DoltStore) updateIssueChecked(ctx context.Context, id string, updates m
 			if !result.Changed {
 				return nil
 			}
-
-			commitMsg := fmt.Sprintf("bd: update %s", id)
-			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
-		})
+			pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: update %s", id))
+			return nil
+		}); err != nil {
+			return err
+		}
+		s.publishPostTx(ctx, pc)
+		return nil
 	}
 
 	// A guarded update that writes the coordination fields (a reassign or a
@@ -356,14 +372,19 @@ func (s *DoltStore) claimIssue(ctx context.Context, id string, actor string) err
 	// The whole write is then resolved by verify-by-re-read (bd-zccb9): under a
 	// degraded server the exit status is not truth in either direction.
 	return s.verifiedClaimWrite(ctx, id, claimedBy(actor), func() error {
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		var pc postTxCommit
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			pc = postTxCommit{}
 			if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor); err != nil {
 				return err
 			}
-
-			commitMsg := fmt.Sprintf("bd: claim %s", id)
-			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
-		})
+			pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: claim %s", id))
+			return nil
+		}); err != nil {
+			return err
+		}
+		s.publishPostTx(ctx, pc)
+		return nil
 	})
 }
 
@@ -386,7 +407,9 @@ func (s *DoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter
 	err := s.withCircuitWrite(ctx, func(ctx context.Context) error {
 		write := func() (*types.Issue, error) {
 			var got *types.Issue
+			var pc postTxCommit
 			werr := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+				pc = postTxCommit{}
 				var err error
 				got, err = issueops.ClaimReadyIssueInTx(ctx, tx, filter, actor)
 				if err != nil {
@@ -395,10 +418,12 @@ func (s *DoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter
 				if got == nil {
 					return nil
 				}
-
-				commitMsg := fmt.Sprintf("bd: claim ready %s", got.ID)
-				return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
+				pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: claim ready %s", got.ID))
+				return nil
 			})
+			if werr == nil {
+				s.publishPostTx(ctx, pc)
+			}
 			return got, werr
 		}
 		var verr error
@@ -468,7 +493,9 @@ func (s *DoltStore) HeartbeatIssue(ctx context.Context, id, actor string) error 
 func (s *DoltStore) ReclaimExpiredLeases(ctx context.Context, olderThan time.Duration, filter types.ReclaimFilter, actor string) ([]types.ReclaimedLease, error) {
 	cutoff := time.Now().UTC().Add(-olderThan)
 	var reclaimed []types.ReclaimedLease
+	var pc postTxCommit
 	err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		var err error
 		reclaimed, err = issueops.ReclaimExpiredLeasesInTx(ctx, tx, cutoff, filter, actor)
 		if err != nil {
@@ -477,12 +504,13 @@ func (s *DoltStore) ReclaimExpiredLeases(ctx context.Context, olderThan time.Dur
 		if len(reclaimed) == 0 {
 			return nil
 		}
-		commitMsg := fmt.Sprintf("bd: reclaim %d expired lease(s)", len(reclaimed))
-		return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
+		pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: reclaim %d expired lease(s)", len(reclaimed)))
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	s.publishPostTx(ctx, pc)
 	return reclaimed, nil
 }
 
@@ -504,14 +532,19 @@ func (s *DoltStore) UnclaimIssue(ctx context.Context, id string, actor string, f
 	// the release landed — never the moment withRetryTx's SQL commit returns.
 	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
 		return s.verifiedClaimWrite(ctx, id, unclaimed(), func() error {
-			return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			var pc postTxCommit
+			if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+				pc = postTxCommit{}
 				if err := issueops.UnclaimIssueInTx(ctx, tx, id, actor, force); err != nil {
 					return err
 				}
-
-				commitMsg := fmt.Sprintf("bd: unclaim %s", id)
-				return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
-			})
+				pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: unclaim %s", id))
+				return nil
+			}); err != nil {
+				return err
+			}
+			s.publishPostTx(ctx, pc)
+			return nil
 		})
 	})
 }
@@ -530,14 +563,19 @@ func (s *DoltStore) UnclaimIssueIfAssignee(ctx context.Context, id string, actor
 	// release landed.
 	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
 		return s.verifiedClaimWrite(ctx, id, unclaimed(), func() error {
-			return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			var pc postTxCommit
+			if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+				pc = postTxCommit{}
 				if err := issueops.UnclaimIssueIfAssigneeInTx(ctx, tx, id, actor, expectedAssignee); err != nil {
 					return err
 				}
-
-				commitMsg := fmt.Sprintf("bd: unclaim %s", id)
-				return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
-			})
+				pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: unclaim %s", id))
+				return nil
+			}); err != nil {
+				return err
+			}
+			s.publishPostTx(ctx, pc)
+			return nil
 		})
 	})
 }
@@ -545,7 +583,9 @@ func (s *DoltStore) UnclaimIssueIfAssignee(ctx context.Context, id string, actor
 // ReopenIssue reopens a done-category issue atomically and stages only the
 // versioned tables that this transaction concretely changed.
 func (s *DoltStore) ReopenIssue(ctx context.Context, id string, reason string, actor string) error {
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+	var pc postTxCommit
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		res, err := issueops.ReopenIssueInTx(ctx, tx, id, reason, actor)
 		if err != nil {
 			return err
@@ -555,13 +595,16 @@ func (s *DoltStore) ReopenIssue(ctx context.Context, id string, reason string, a
 		}
 		switch {
 		case !res.IsWisp:
-			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, fmt.Sprintf("bd: reopen %s", id))
+			pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: reopen %s", id))
 		case res.IssueRowsChanged:
-			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues"}, fmt.Sprintf("bd: reopen %s", id))
-		default:
-			return nil
+			pc.stage([]string{"issues"}, fmt.Sprintf("bd: reopen %s", id))
 		}
-	})
+		return nil
+	}); err != nil {
+		return err
+	}
+	s.publishPostTx(ctx, pc)
+	return nil
 }
 
 // UpdateIssueType changes the issue_type field of an issue.
@@ -592,14 +635,19 @@ func (s *DoltStore) closeIssue(ctx context.Context, id string, reason string, ac
 	// locking — FOR UPDATE / SKIP LOCKED are parse-only no-ops
 	// (https://www.dolthub.com/blog/2023-10-23-hold-my-beer/) — so retry is the
 	// only safety net. withRetryTx owns BeginTx and the final Commit.
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+	var pc postTxCommit
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		if _, err := issueops.CloseIssueInTx(ctx, tx, id, reason, actor, session); err != nil {
 			return err
 		}
-
-		commitMsg := fmt.Sprintf("bd: close %s", id)
-		return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
-	})
+		pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: close %s", id))
+		return nil
+	}); err != nil {
+		return err
+	}
+	s.publishPostTx(ctx, pc)
+	return nil
 }
 
 // CloseIssueChecked closes an issue but refuses with storage.ErrCloseBlocked
@@ -633,18 +681,20 @@ func (s *DoltStore) closeIssueChecked(ctx context.Context, id string, actor stri
 	// surfaces it permanently and the transaction rolls back — no close and no
 	// event are written (the atomic-refuse property).
 	var result storage.CloseIssueResult
+	var pc postTxCommit
 	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		res, err := issueops.CloseIssueCheckedInTx(ctx, tx, id, opts.Reason, actor, opts.Session, opts.Force, opts.ExpectedVersion)
 		if err != nil {
 			return err
 		}
 		result = storage.CloseIssueResult{Unchanged: res.AlreadyClosed, OpenChildren: res.OpenChildren}
-
-		commitMsg := fmt.Sprintf("bd: close %s", id)
-		return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
+		pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: close %s", id))
+		return nil
 	}); err != nil {
 		return storage.CloseIssueResult{}, err
 	}
+	s.publishPostTx(ctx, pc)
 	return result, nil
 }
 
@@ -661,19 +711,19 @@ func (s *DoltStore) deleteIssue(ctx context.Context, id string) error {
 		return s.deleteWisp(ctx, id)
 	}
 
+	var pc postTxCommit
 	if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		// storage.DeleteIssue carries no actor, so the journal rows record none.
 		if err := issueops.DeleteIssueInTx(ctx, tx, id, ""); err != nil {
 			return err
 		}
-
-		commitMsg := fmt.Sprintf("bd: delete %s", id)
-		return s.doltAddAndCommitInTx(ctx, tx,
-			[]string{"issues", "dependencies", "labels", "comments", "events", "provenance_events", "child_counters", "issue_snapshots", "compaction_snapshots"},
-			commitMsg)
+		pc.stage(deleteVersionedTables, fmt.Sprintf("bd: delete %s", id))
+		return nil
 	}); err != nil {
 		return s.recordDoltPublicationFailure(ctx, err)
 	}
+	s.publishPostTx(ctx, pc)
 	return nil
 }
 
@@ -689,6 +739,10 @@ const deleteBatchSize = 50
 // maxRecursiveResults is the safety limit for the total number of issues discovered
 // during recursive dependent traversal. Used by wisps.go.
 const maxRecursiveResults = 10000
+
+// deleteVersionedTables are the versioned tables a permanent-issue delete
+// touches; DeleteIssue and DeleteIssues stage them post-commit.
+var deleteVersionedTables = []string{"issues", "dependencies", "labels", "comments", "events", "provenance_events", "child_counters", "issue_snapshots", "compaction_snapshots"}
 
 // queryBatchSize controls the maximum number of IDs per IN-clause in read
 // queries (label hydration, wisp lookups). Without batching, queries like
@@ -738,7 +792,9 @@ func (s *DoltStore) deleteIssues(ctx context.Context, ids []string, cascade bool
 	}
 
 	var result *types.DeleteIssuesResult
+	var pc postTxCommit
 	if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		pc = postTxCommit{}
 		// storage.DeleteIssues carries no actor, so the journal rows record none.
 		r, err := issueops.DeleteIssuesInTx(ctx, tx, ids, cascade, force, dryRun, "")
 		if err != nil {
@@ -749,11 +805,8 @@ func (s *DoltStore) deleteIssues(ctx context.Context, ids []string, cascade bool
 		if dryRun {
 			return nil
 		}
-
-		commitMsg := fmt.Sprintf("bd: delete %d issue(s)", result.DeletedCount)
-		return s.doltAddAndCommitInTx(ctx, tx,
-			[]string{"issues", "dependencies", "labels", "comments", "events", "provenance_events", "child_counters", "issue_snapshots", "compaction_snapshots"},
-			commitMsg)
+		pc.stage(deleteVersionedTables, fmt.Sprintf("bd: delete %d issue(s)", result.DeletedCount))
+		return nil
 	}); err != nil {
 		// Preserve partial result (e.g., OrphanedIssues) on error.
 		if result != nil {
@@ -761,6 +814,7 @@ func (s *DoltStore) deleteIssues(ctx context.Context, ids []string, cascade bool
 		}
 		return result, s.recordDoltPublicationFailure(ctx, err)
 	}
+	s.publishPostTx(ctx, pc)
 	result.DeletedCount += wispDeleteCount
 
 	return result, nil

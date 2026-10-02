@@ -237,53 +237,60 @@ func newClaimCommitBoundaryStore(d *claimCommitBoundaryDriver) *DoltStore {
 	return &DoltStore{db: sql.OpenDB(d)}
 }
 
-func TestClaimIssueDoltCommitResponseLossIsIndeterminateAndNotReplayed(t *testing.T) {
+// Post-transaction ordering contract (LatentLabsSpace/NEXUS#92 port): the
+// SQL transaction commits FIRST, then DOLT_ADD/DOLT_COMMIT publish the version
+// entry on their own connection. A history-commit failure therefore happens
+// AFTER the mutation is durable, so the write reports success (the failure is
+// logged and counted as bd.db.post_tx_commit_dropped, never propagated — see
+// publishPostTx). Under the old in-tx ordering the same failure rolled the
+// mutation back, so these tests used to expect ErrCommitIndeterminate; the
+// safety properties they guard — exactly one mutation, no replay, no double
+// claim — are unchanged and still asserted.
+func TestClaimIssuePostTxDoltCommitLossIsAppliedAndNotReplayed(t *testing.T) {
 	driver := &claimCommitBoundaryDriver{commitErr: testConnectionLoss}
 	store := newClaimCommitBoundaryStore(driver)
 	t.Cleanup(func() { _ = store.db.Close() })
 
-	err := store.ClaimIssue(context.Background(), "claim-boundary", "alice")
-	if !errors.Is(err, ErrCommitIndeterminate) {
-		t.Fatalf("ClaimIssue() error = %v, want ErrCommitIndeterminate", err)
-	}
-	if !errors.Is(err, testConnectionLoss) {
-		t.Fatalf("ClaimIssue() error = %v, want cause %v", err, testConnectionLoss)
+	if err := store.ClaimIssue(context.Background(), "claim-boundary", "alice"); err != nil {
+		t.Fatalf("ClaimIssue() error = %v, want nil: the SQL commit landed before the history commit failed", err)
 	}
 
 	driver.mu.Lock()
 	defer driver.mu.Unlock()
 	if driver.claimMutations != 1 {
-		t.Fatalf("claim mutations = %d, want 1", driver.claimMutations)
+		t.Fatalf("claim mutations = %d, want 1 (no replay)", driver.claimMutations)
+	}
+	if driver.txCommits != 1 || driver.txRollbacks != 0 {
+		t.Fatalf("SQL transaction outcomes = commits:%d rollbacks:%d, want commits:1 rollbacks:0", driver.txCommits, driver.txRollbacks)
 	}
 	if driver.doltCommits != 1 {
-		t.Fatalf("DOLT_COMMIT calls = %d, want 1", driver.doltCommits)
-	}
-	if driver.txCommits != 0 || driver.txRollbacks != 1 {
-		t.Fatalf("SQL transaction outcomes = commits:%d rollbacks:%d, want commits:0 rollbacks:1", driver.txCommits, driver.txRollbacks)
+		t.Fatalf("DOLT_COMMIT calls = %d, want 1 (connection loss is not retried post-tx)", driver.doltCommits)
 	}
 }
 
-func TestClaimIssueDoltAddFailureCannotReportSuccess(t *testing.T) {
+func TestClaimIssuePostTxDoltAddFailureDoesNotFailAppliedClaim(t *testing.T) {
 	stageErr := errors.New("stage failed")
 	driver := &claimCommitBoundaryDriver{stageErr: stageErr, nothingToCommit: true}
 	store := newClaimCommitBoundaryStore(driver)
 	t.Cleanup(func() { _ = store.db.Close() })
 
-	err := store.ClaimIssue(context.Background(), "claim-boundary", "alice")
-	if !errors.Is(err, stageErr) {
-		t.Fatalf("ClaimIssue() error = %v, want stage failure %v", err, stageErr)
+	if err := store.ClaimIssue(context.Background(), "claim-boundary", "alice"); err != nil {
+		t.Fatalf("ClaimIssue() error = %v, want nil: staging runs after the claim is durable", err)
 	}
 
 	driver.mu.Lock()
 	defer driver.mu.Unlock()
+	if driver.claimMutations != 1 {
+		t.Fatalf("claim mutations = %d, want 1 (no replay)", driver.claimMutations)
+	}
 	if driver.stageCalls != 1 {
 		t.Fatalf("DOLT_ADD calls = %d, want 1", driver.stageCalls)
 	}
 	if driver.doltCommits != 0 {
 		t.Fatalf("DOLT_COMMIT calls = %d, want 0 after staging failure", driver.doltCommits)
 	}
-	if driver.txCommits != 0 || driver.txRollbacks != 1 {
-		t.Fatalf("SQL transaction outcomes = commits:%d rollbacks:%d, want commits:0 rollbacks:1", driver.txCommits, driver.txRollbacks)
+	if driver.txCommits != 1 || driver.txRollbacks != 0 {
+		t.Fatalf("SQL transaction outcomes = commits:%d rollbacks:%d, want commits:1 rollbacks:0", driver.txCommits, driver.txRollbacks)
 	}
 }
 
@@ -296,11 +303,11 @@ func TestClaimReadyIssueDoltCommitResponseLossDoesNotDoubleClaim(t *testing.T) {
 	t.Cleanup(func() { _ = store.db.Close() })
 
 	claimed, err := store.ClaimReadyIssue(context.Background(), types.WorkFilter{}, "alice")
-	if !errors.Is(err, ErrCommitIndeterminate) {
-		t.Fatalf("ClaimReadyIssue() error = %v, want ErrCommitIndeterminate", err)
+	if err != nil {
+		t.Fatalf("ClaimReadyIssue() error = %v, want nil: the claim landed before the history commit failed", err)
 	}
-	if claimed != nil {
-		t.Fatalf("ClaimReadyIssue() claimed = %+v, want nil while commit outcome is indeterminate", claimed)
+	if claimed == nil || claimed.ID != "ready-first" {
+		t.Fatalf("ClaimReadyIssue() claimed = %+v, want ready-first", claimed)
 	}
 
 	driver.mu.Lock()
@@ -316,14 +323,6 @@ func TestClaimReadyIssueDoltCommitResponseLossDoesNotDoubleClaim(t *testing.T) {
 	}
 }
 
-// TestClaimReadyIssueVerifyFailureDoesNotRecordCircuitSuccess pins the fix for
-// the verify-gated circuit-accounting major: when the SQL write commits but the
-// post-write verify-by-re-read contradicts the reported success, the breaker
-// must NOT be reset. withCircuitWrite records terminal success only after
-// verifiedReadyClaim returns nil, and the nested withRetryTx / verify reads
-// defer their own success reset to that boundary. Before the fix, withRetryTx
-// reset the breaker the instant the SQL commit returned — laundering a phantom
-// claim (reported success, failed verification) into breaker-health optimism.
 func TestClaimReadyIssueVerifyFailureDoesNotRecordCircuitSuccess(t *testing.T) {
 	t.Setenv("BEADS_TEST_MODE", "")
 	// The commit succeeds (no commitErr/sqlCommitErr), but the verify re-read
@@ -500,12 +499,10 @@ func TestIssueOperationsUpdateGuardedVerifyFailureDoesNotRecordCircuitSuccess(t 
 	}
 }
 
-func TestUpdateIssueCheckedMixedCoordinationCommitLossIsNotMasked(t *testing.T) {
+func TestUpdateIssueCheckedMixedCoordinationPostTxCommitLossIsVerifiedApplied(t *testing.T) {
 	driver := &claimCommitBoundaryDriver{
-		commitErr:      testConnectionLoss,
-		checkedUpdate:  true,
-		verifyAssignee: "alice",
-		verifyStatus:   types.StatusInProgress,
+		commitErr:     testConnectionLoss,
+		checkedUpdate: true,
 	}
 	store := newClaimCommitBoundaryStore(driver)
 	store.serverMode = true
@@ -521,20 +518,23 @@ func TestUpdateIssueCheckedMixedCoordinationCommitLossIsNotMasked(t *testing.T) 
 		ExpectedAssignee: &expectedAssignee,
 		ExpectedStatus:   &expectedStatus,
 	})
-	if !errors.Is(err, ErrCommitIndeterminate) {
-		t.Fatalf("UpdateIssueChecked() error = %v, want ErrCommitIndeterminate", err)
-	}
-	if !errors.Is(err, testConnectionLoss) {
-		t.Fatalf("UpdateIssueChecked() error = %v, want cause %v", err, testConnectionLoss)
+	if err != nil {
+		t.Fatalf("UpdateIssueChecked() error = %v, want nil: the SQL commit is durable and a dropped post-tx Dolt commit must not fail it", err)
 	}
 
 	driver.mu.Lock()
 	defer driver.mu.Unlock()
 	if driver.updateMutations != 1 || driver.eventInserts != 1 {
-		t.Fatalf("mixed update attempts = updates:%d events:%d, want updates:1 events:1", driver.updateMutations, driver.eventInserts)
+		t.Fatalf("mixed update attempts = updates:%d events:%d, want updates:1 events:1 (no replay)", driver.updateMutations, driver.eventInserts)
 	}
-	if driver.txAttempts != 1 || driver.doltCommits != 1 || driver.txRollbacks != 1 {
-		t.Fatalf("transaction outcomes = attempts:%d Dolt commits:%d rollbacks:%d, want 1, 1, 1", driver.txAttempts, driver.doltCommits, driver.txRollbacks)
+	if driver.txAttempts != 1 || driver.txCommits != 1 || driver.txRollbacks != 0 || driver.doltCommits != 1 {
+		t.Fatalf("transaction outcomes = attempts:%d commits:%d rollbacks:%d Dolt commits:%d, want 1, 1, 0, 1",
+			driver.txAttempts, driver.txCommits, driver.txRollbacks, driver.doltCommits)
+	}
+	// A mixed update (coordination + ordinary field) is not claim-family, so it
+	// keeps its exit status: the only claim-state read is the in-tx precondition.
+	if driver.claimStateReads != 1 {
+		t.Fatalf("claim state reads = %d, want 1 (precondition only; mixed updates are not verify-resolved)", driver.claimStateReads)
 	}
 }
 
