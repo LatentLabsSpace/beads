@@ -190,21 +190,23 @@ func metadataSlotWriteCases() []struct {
 	}
 }
 
-func TestMetadataSlotWritesSurfaceDoltAddFailure(t *testing.T) {
+// Post-transaction ordering (NEXUS#92): the SQL transaction commits first and
+// the Dolt version commit runs afterwards. A DOLT_ADD failure after the data is
+// durable must not fail the write or roll anything back — the change rides the
+// next Dolt commit.
+func TestMetadataSlotWritesPostTxDoltAddFailureDoesNotFailAppliedWrite(t *testing.T) {
 	for _, tc := range metadataSlotWriteCases() {
 		t.Run(tc.name, func(t *testing.T) {
-			stageErr := errors.New("stage failed")
 			driver := &slotCommitBoundaryDriver{
 				metadata:        tc.metadata,
-				stageErr:        stageErr,
+				stageErr:        errors.New("stage failed"),
 				nothingToCommit: true,
 			}
 			store := newSlotCommitBoundaryStore(driver)
 			t.Cleanup(func() { _ = store.db.Close() })
 
-			err := tc.run(store)
-			if !errors.Is(err, stageErr) {
-				t.Fatalf("metadata slot write error = %v, want stage failure %v", err, stageErr)
+			if err := tc.run(store); err != nil {
+				t.Fatalf("metadata slot write error = %v, want nil: the SQL commit is durable and a post-tx DOLT_ADD failure must not fail it", err)
 			}
 
 			driver.mu.Lock()
@@ -218,14 +220,14 @@ func TestMetadataSlotWritesSurfaceDoltAddFailure(t *testing.T) {
 			if driver.metadataUpdates != 1 || driver.eventInserts != 1 {
 				t.Fatalf("mutation attempts = updates:%d events:%d, want updates:1 events:1", driver.metadataUpdates, driver.eventInserts)
 			}
-			if driver.txAttempts != 1 || driver.txCommits != 0 || driver.txRollbacks != 1 {
-				t.Fatalf("SQL transaction outcomes = attempts:%d commits:%d rollbacks:%d, want attempts:1 commits:0 rollbacks:1", driver.txAttempts, driver.txCommits, driver.txRollbacks)
+			if driver.txAttempts != 1 || driver.txCommits != 1 || driver.txRollbacks != 0 {
+				t.Fatalf("SQL transaction outcomes = attempts:%d commits:%d rollbacks:%d, want attempts:1 commits:1 rollbacks:0", driver.txAttempts, driver.txCommits, driver.txRollbacks)
 			}
 		})
 	}
 }
 
-func TestMetadataSlotWritesDoltCommitResponseLossIsIndeterminateAndNotReplayed(t *testing.T) {
+func TestMetadataSlotWritesPostTxDoltCommitLossIsAppliedAndNotReplayed(t *testing.T) {
 	for _, tc := range metadataSlotWriteCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			driver := &slotCommitBoundaryDriver{
@@ -235,12 +237,8 @@ func TestMetadataSlotWritesDoltCommitResponseLossIsIndeterminateAndNotReplayed(t
 			store := newSlotCommitBoundaryStore(driver)
 			t.Cleanup(func() { _ = store.db.Close() })
 
-			err := tc.run(store)
-			if !errors.Is(err, ErrCommitIndeterminate) {
-				t.Fatalf("metadata slot write error = %v, want ErrCommitIndeterminate", err)
-			}
-			if !errors.Is(err, testConnectionLoss) {
-				t.Fatalf("metadata slot write error = %v, want cause %v", err, testConnectionLoss)
+			if err := tc.run(store); err != nil {
+				t.Fatalf("metadata slot write error = %v, want nil: the SQL commit is durable and a lost post-tx DOLT_COMMIT response must not fail it", err)
 			}
 
 			driver.mu.Lock()
@@ -248,11 +246,11 @@ func TestMetadataSlotWritesDoltCommitResponseLossIsIndeterminateAndNotReplayed(t
 			if driver.metadataUpdates != 1 || driver.eventInserts != 1 {
 				t.Fatalf("mutation attempts = updates:%d events:%d, want updates:1 events:1 (no replay)", driver.metadataUpdates, driver.eventInserts)
 			}
-			if driver.stageCalls != 2 || driver.doltCommits != 1 {
-				t.Fatalf("Dolt calls = adds:%d commits:%d, want adds:2 commits:1", driver.stageCalls, driver.doltCommits)
+			if driver.stageCalls < 1 || driver.doltCommits != 1 {
+				t.Fatalf("Dolt calls = adds:%d commits:%d, want adds>=1 commits:1 (no replayed commit)", driver.stageCalls, driver.doltCommits)
 			}
-			if driver.txAttempts != 1 || driver.txCommits != 0 || driver.txRollbacks != 1 {
-				t.Fatalf("SQL transaction outcomes = attempts:%d commits:%d rollbacks:%d, want attempts:1 commits:0 rollbacks:1", driver.txAttempts, driver.txCommits, driver.txRollbacks)
+			if driver.txAttempts != 1 || driver.txCommits != 1 || driver.txRollbacks != 0 {
+				t.Fatalf("SQL transaction outcomes = attempts:%d commits:%d rollbacks:%d, want attempts:1 commits:1 rollbacks:0", driver.txAttempts, driver.txCommits, driver.txRollbacks)
 			}
 		})
 	}
