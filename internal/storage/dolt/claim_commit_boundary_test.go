@@ -323,6 +323,14 @@ func TestClaimReadyIssueDoltCommitResponseLossDoesNotDoubleClaim(t *testing.T) {
 	}
 }
 
+// TestClaimReadyIssueVerifyFailureDoesNotRecordCircuitSuccess pins the fix for
+// the verify-gated circuit-accounting major: when the SQL write commits but the
+// post-write verify-by-re-read contradicts the reported success, the breaker
+// must NOT be reset. withCircuitWrite records terminal success only after
+// verifiedReadyClaim returns nil, and the nested withRetryTx / verify reads
+// defer their own success reset to that boundary. Before the fix, withRetryTx
+// reset the breaker the instant the SQL commit returned — laundering a phantom
+// claim (reported success, failed verification) into breaker-health optimism.
 func TestClaimReadyIssueVerifyFailureDoesNotRecordCircuitSuccess(t *testing.T) {
 	t.Setenv("BEADS_TEST_MODE", "")
 	// The commit succeeds (no commitErr/sqlCommitErr), but the verify re-read
