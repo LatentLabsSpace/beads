@@ -26,19 +26,28 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/workspacegate"
 )
 
-// Storage is the interface for beads storage operations
+// Storage is the interface for beads storage operations. Its
+// RunInTransaction callback is invoked at most once per public call; callers
+// retry it explicitly after a callback has started when their operation is
+// safe to repeat.
 type Storage = beads.Storage
 
-func configuredBackendUnavailable(backend string) error {
+// configuredBackendUnavailable is the public open path's fail-closed refusal for
+// metadata naming a removed or unrecognized backend. beadsDir and cfg let the
+// refusal detect an already-present Dolt database and name the exact
+// metadata.json edit that heals the workspace, instead of the export-and-
+// reinitialize path that would destroy it.
+func configuredBackendUnavailable(backend, beadsDir string, cfg *configfile.Config) error {
 	switch backend {
 	case configfile.BackendPostgres, configfile.BackendMySQL, configfile.BackendSQLite:
-		return configfile.RemovedBackendError(backend)
+		return configfile.RemovedBackendErrorAt(backend, beadsDir, cfg)
 	default:
-		return configfile.UnknownBackendError(backend)
+		return configfile.UnknownBackendErrorAt(backend, beadsDir, cfg)
 	}
 }
 
@@ -193,7 +202,8 @@ func AsDependentQuerier(s Storage) (DependentQuerier, bool) {
 // and ErrNotClaimable — the ones ParseClaimConflict recovers assignee/status
 // detail from — are re-exported with the other error sentinels below.
 var (
-	ErrCircuitOpen = dolt.ErrCircuitOpen
+	ErrCircuitOpen         = dolt.ErrCircuitOpen
+	ErrCommitIndeterminate = storage.ErrCommitIndeterminate
 )
 
 // IssueClaimer is the atomic-claim surface of a Storage. ClaimIssue and
@@ -265,6 +275,39 @@ type (
 	VCStatus    = storage.Status
 	StatusEntry = storage.StatusEntry
 )
+
+// AllowSharedSchemaMigration authorizes this process to apply pending schema
+// migrations to a database that is SHARED with other bd clients — a Dolt
+// sql-server, where migrating promotes the schema version for every connected
+// client at once and clients still running an older bd will refuse the
+// database until they are upgraded (gastownhall/beads#5920).
+//
+// Without it, an embedder that upgrades its beads dependency across a schema
+// bump gets a migration-gate error from every writable Open* call, whose
+// guidance names CLI commands (`bd migrate schema`) that mean nothing inside a
+// library process. This is the programmatic equivalent of that command.
+//
+// It is process-local and set-or-clear, which is the point: the alternative —
+// os.Setenv("BD_ALLOW_REMOTE_MIGRATE", "1") — is process-GLOBAL and inherited
+// by every child process the embedder spawns, including git hooks and dolt
+// subprocesses.
+//
+// The parity with that env var is only in the process-local mechanism, not the
+// reach: BD_ALLOW_REMOTE_MIGRATE=1 unlocks BOTH the no-remote and the
+// remote-backed shared arms, while this authorizes ONLY the no-remote arm. A
+// remote-backed shared store still needs --force / AllowRemoteMigrateEnv,
+// because #4259 cross-clone coordination is a stronger, different contract.
+//
+// Call it before the Open* call that should perform the migration, and clear
+// it afterwards. Only grant it once the operator has confirmed that every
+// other client of the server is upgraded; it is a coordination decision the
+// library cannot make, because other clients' versions are not observable from
+// this process.
+//
+// Embedded (single-writer) databases never need it: they still auto-migrate.
+func AllowSharedSchemaMigration(allow bool) {
+	schema.SetSharedMigrateConsent(allow)
+}
 
 // Open opens a Dolt-backed beads database at the given path.
 // This always opens in embedded mode. Use OpenFromConfig to respect
@@ -509,7 +552,12 @@ var (
 	ErrVersionMismatch = storage.ErrVersionMismatch
 	ErrSelfDependency  = domain.ErrSelfDependency
 	ErrDependencyCycle = domain.ErrDependencyCycle
-	ErrFieldTooLong    = types.ErrFieldTooLong
+	// ErrDependencySourceNotFound and ErrDependencyTargetNotFound are the two
+	// endpoint-existence refusals AddDependency and AddDependencies raise; the
+	// typed value carrying the missing id is DependencyEndpointNotFoundError.
+	ErrDependencySourceNotFound = domain.ErrDependencySourceNotFound
+	ErrDependencyTargetNotFound = domain.ErrDependencyTargetNotFound
+	ErrFieldTooLong             = types.ErrFieldTooLong
 	// ErrGateBusy is returned by OpenGated when a maintenance operation
 	// holds the workspace or physical-root gate exclusively and the wait
 	// budget ran out. Alias of the internal sentinel so errors.Is works
@@ -526,3 +574,8 @@ type DependencyTypeConflictError = domain.DependencyTypeConflictError
 // edge would gate an issue on its own ancestor/descendant (a gate that can
 // never clear).
 type DependencyHierarchyConflictError = domain.DependencyHierarchyConflictError
+
+// DependencyEndpointNotFoundError is returned by AddDependency when an edge
+// names an endpoint this database can see the absence of; callers errors.As it
+// to read the missing id instead of parsing the message.
+type DependencyEndpointNotFoundError = domain.DependencyEndpointNotFoundError

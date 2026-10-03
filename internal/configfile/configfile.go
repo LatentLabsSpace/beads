@@ -122,6 +122,35 @@ func Load(beadsDir string) (*Config, error) {
 	return &cfg, nil
 }
 
+// LoadForDiscovery reads workspace metadata without migrating or rewriting it.
+//
+// Store admission uses this only to classify a workspace before a command can
+// open storage. In particular, legacy config.json remains in place so a failed
+// admission cannot turn a recoverable old workspace into a partially migrated
+// one. Unknown JSON fields remain tolerated here because callers use the
+// result only to decide whether to issue a conservative refusal; normal store
+// selection keeps its existing validation.
+func LoadForDiscovery(beadsDir string) (*Config, error) {
+	data, err := os.ReadFile(ConfigPath(beadsDir)) // #nosec G304 -- beadsDir is caller-selected workspace state
+	if os.IsNotExist(err) {
+		data, err = os.ReadFile(filepath.Join(beadsDir, "config.json")) // #nosec G304 -- legacy workspace state
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading legacy config: %w", err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("reading config: %w", err)
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing config: %w", err)
+	}
+	return &cfg, nil
+}
+
 func (c *Config) Save(beadsDir string) error {
 	configPath := ConfigPath(beadsDir)
 
@@ -594,10 +623,15 @@ func (c *Config) GetDoltServerTLS() bool {
 // When set, dolt stores its data in this directory instead of .beads/dolt/.
 // This is useful on WSL where the project lives on a slow NTFS mount (9P)
 // but dolt data can be placed on native ext4 for significantly better I/O.
-// Checks BEADS_DOLT_DATA_DIR env var first, then config.
+// Checks BEADS_DOLT_DATA_DIR env var first, then config. Nil-safe, like
+// GetBackend: rejection paths resolve the data dir for workspaces whose config
+// may not have loaded, and the env override still applies to those.
 func (c *Config) GetDoltDataDir() string {
 	if d := os.Getenv("BEADS_DOLT_DATA_DIR"); d != "" {
 		return d
+	}
+	if c == nil {
+		return ""
 	}
 	return c.DoltDataDir
 }

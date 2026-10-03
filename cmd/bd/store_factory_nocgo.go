@@ -29,11 +29,28 @@ func usesProxiedServer() bool {
 	return cmdCtx != nil && cmdCtx.ProxiedServerMode
 }
 
-func newDoltStore(ctx context.Context, cfg *dolt.Config) (storage.DoltStorage, error) {
+// newRegisteredBackendStore is the non-CGO twin of the CGO build's registry
+// factory: identical, since the backend registry does not depend on CGO. It
+// exists here too so the root pre-run's registry arm has one activating
+// construction path in both builds.
+func newRegisteredBackendStore(ctx context.Context, name, beadsDir string, readOnly bool) (s storage.DoltStorage, err error) {
+	defer func() { s, err = activateEventsJournalStore(beadsDir, s, err) }()
+	backend, ok := backends.Lookup(name)
+	if !ok {
+		return nil, fmt.Errorf("storage backend %q is not registered", name)
+	}
+	if readOnly {
+		return backend.OpenReadOnly(ctx, beadsDir)
+	}
+	return backend.Open(ctx, beadsDir)
+}
+
+// newDoltStore applies events-journal activation for the same reason its CGO
+// twin does — see the note at the top of events_journal.go.
+func newDoltStore(ctx context.Context, cfg *dolt.Config) (s storage.DoltStorage, err error) {
+	defer func() { s, err = activateEventsJournalStore(cfg.BeadsDir, s, err) }()
 	if cfg.ProxiedServer {
-		// TODO: this should not be a store
-		// it should be a uow provider
-		return nil, fmt.Errorf("proxy server store should be uow provider")
+		return nil, errProxiedStoreUnrouted()
 	}
 	if !cfg.ServerMode {
 		return nil, fmt.Errorf("%s", nocgoEmbeddedErrMsg)
@@ -47,7 +64,8 @@ func acquireEmbeddedLock(_ string, _ bool) (util.Unlocker, error) {
 }
 
 // newDoltStoreFromConfig creates a SQL-server-backed storage backend from config.
-func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
+func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (s storage.DoltStorage, err error) {
+	defer func() { s, err = activateEventsJournalStore(beadsDir, s, err) }()
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
 		// Name the real cause: without this, a present-but-unloadable
@@ -55,7 +73,7 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltS
 		// message below.
 		return nil, fmt.Errorf("load %s: %w", configfile.ConfigPath(beadsDir), err)
 	}
-	if err := validateConfiguredBackend(cfg); err != nil {
+	if err := validateConfiguredBackend(cfg, beadsDir); err != nil {
 		return nil, err
 	}
 	cfg = normalizeLoadedConfig(cfg)
@@ -63,13 +81,7 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltS
 		return backend.Open(ctx, beadsDir)
 	}
 	if cfg != nil && cfg.IsDoltProxiedServerMode() {
-		// TODO: this needs to be uow provider
-		return nil, fmt.Errorf("proxy server store should be uow provider")
-		// 	return newProxiedServerStore(ctx, &dolt.Config{
-		// 		BeadsDir:      beadsDir,
-		// 		Database:      cfg.GetDoltDatabase(),
-		// 		ProxiedServer: true,
-		// 	})
+		return nil, errProxiedStoreUnrouted()
 	}
 	if cfg != nil && cfg.IsDoltServerMode() {
 		return dolt.NewFromConfig(ctx, beadsDir)
@@ -77,13 +89,16 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltS
 	return nil, fmt.Errorf("%s", nocgoEmbeddedErrMsg)
 }
 
-// newReadOnlyStoreFromConfig creates a read-only SQL-server-backed storage backend.
+// newReadOnlyStoreFromConfig creates a read-only SQL-server-backed storage
+// backend. It does not activate the events journal: the store refuses writes,
+// so there is no mutation for a journal row to accompany (exemption is recorded
+// in the construction guard).
 func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
 		return nil, fmt.Errorf("load %s: %w", configfile.ConfigPath(beadsDir), err)
 	}
-	if err := validateConfiguredBackend(cfg); err != nil {
+	if err := validateConfiguredBackend(cfg, beadsDir); err != nil {
 		return nil, err
 	}
 	cfg = normalizeLoadedConfig(cfg)
@@ -91,14 +106,7 @@ func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.D
 		return backend.OpenReadOnly(ctx, beadsDir)
 	}
 	if cfg != nil && cfg.IsDoltProxiedServerMode() {
-		// TODO: this needs to be uow provider
-		return nil, fmt.Errorf("proxy server store needs to be uow provider")
-		// return newProxiedServerStore(ctx, &dolt.Config{
-		// 	BeadsDir:      beadsDir,
-		// 	Database:      cfg.GetDoltDatabase(),
-		// 	ProxiedServer: true,
-		// 	ReadOnly:      true,
-		// })
+		return nil, errProxiedStoreUnrouted()
 	}
 	if cfg != nil && cfg.IsDoltServerMode() {
 		return dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})

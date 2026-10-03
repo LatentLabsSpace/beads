@@ -13,6 +13,7 @@ import (
 
 	mysql "github.com/go-sql-driver/mysql"
 
+	"github.com/steveyegge/beads/internal/storage"
 	storageissueops "github.com/steveyegge/beads/internal/storage/issueops"
 )
 
@@ -91,7 +92,9 @@ type seqConn struct {
 
 func (c *seqConn) Prepare(string) (driver.Stmt, error) { return nil, driver.ErrSkip }
 func (c *seqConn) Close() error                        { return nil }
-func (c *seqConn) Begin() (driver.Tx, error)           { return c.BeginTx(context.Background(), driver.TxOptions{}) }
+func (c *seqConn) Begin() (driver.Tx, error) {
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
 
 func (c *seqConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
 	c.parent.rec.add(c.id, "BEGIN")
@@ -119,6 +122,11 @@ func (c *seqConn) QueryContext(_ context.Context, query string, _ []driver.Named
 		if rows, ok := c.parent.rows(query); ok {
 			return rows, nil
 		}
+	}
+	if strings.Contains(query, "FROM dolt_status") {
+		// doltAddAndCommit's empty-commit guard: report one staged row so the
+		// post-tx sequence under test still reaches DOLT_COMMIT.
+		return &valRows{cols: []string{"count"}, vals: [][]driver.Value{{int64(1)}}}, nil
 	}
 	return &seqRows{}, nil
 }
@@ -336,6 +344,75 @@ func TestPostTxDoltCommitFailureDoesNotFailMutation(t *testing.T) {
 	}
 }
 
+// TestBatchMutatorPostTxDoltCommitFailureReturnsSuccess pins the batch-path
+// facet of the swallow contract (PR #6040 review, cat-4 gap). CreateBatch,
+// ApplyBatch, and CloseBatch all funnel through runIssueOperationTxWithMessage
+// — the message-composing entry point — and, unlike the claim paths, have NO
+// verify-by-re-read recovery. So a post-tx DOLT_COMMIT failure on a batch must
+// still report success: the batch's data COMMITted (durable in the branch
+// working set) and was staged by DOLT_ADD before the trailing history commit
+// was attempted, and surfacing the audit-commit failure would make a batch
+// caller retry an already-applied batch (double-apply/double-create). This
+// drives that exact entry point with the commit message composed from what
+// "landed", exactly as the batch mutators do.
+func TestBatchMutatorPostTxDoltCommitFailureReturnsSuccess(t *testing.T) {
+	rec := &seqRecorder{}
+	connector := &seqConnector{rec: rec}
+	connector.queryErr = func(query string) error {
+		if strings.Contains(query, "DOLT_COMMIT") {
+			return errors.New("boom: injected dolt commit failure")
+		}
+		return nil
+	}
+	db := sql.OpenDB(connector)
+	defer func() { _ = db.Close() }()
+
+	s := &DoltStore{db: db}
+
+	// Mirror a batch mutator: run the item work in the tx, then compose the
+	// commit message from what landed. CreateBatch/ApplyBatch/CloseBatch all
+	// build their message inside the body for exactly this reason, which is why
+	// they use runIssueOperationTxWithMessage rather than runIssueOperationTx.
+	err := s.runIssueOperationTxWithMessage(context.Background(), func(tx *sql.Tx) (storageissueops.ChangedTables, string, error) {
+		if _, err := tx.ExecContext(context.Background(), "INSERT INTO issues (id) VALUES ('batch-1')"); err != nil {
+			return nil, "", err
+		}
+		return storageissueops.ChangedTables{"issues": true}, "bd: create 1 issue (batch)", nil
+	})
+	if err != nil {
+		t.Fatalf("batch post-tx dolt commit failure must not fail the mutation (data committed); got: %v", err)
+	}
+
+	// Durability proof: the batch data must have COMMITted and been staged by
+	// DOLT_ADD before the swallowed DOLT_COMMIT — i.e. it is in the working set,
+	// not lost — and the operation still returned success above.
+	events := rec.snapshot()
+	idx := func(pred func(string) bool) int {
+		for i, ev := range events {
+			if pred(ev) {
+				return i
+			}
+		}
+		return -1
+	}
+	commitIdx := idx(func(ev string) bool { return ev == "COMMIT" })
+	doltAddIdx := idx(func(ev string) bool { return strings.Contains(ev, "DOLT_ADD") })
+	doltCommitIdx := idx(func(ev string) bool { return strings.Contains(ev, "DOLT_COMMIT") })
+	if commitIdx == -1 {
+		t.Fatalf("batch data transaction never committed; events: %v", events)
+	}
+	if doltAddIdx == -1 {
+		t.Fatalf("post-tx DOLT_ADD never staged the batch working set; events: %v", events)
+	}
+	if doltCommitIdx == -1 {
+		t.Fatalf("post-tx DOLT_COMMIT never attempted; events: %v", events)
+	}
+	if !(commitIdx < doltAddIdx && doltAddIdx < doltCommitIdx) {
+		t.Fatalf("batch durability ordering violated: want COMMIT(%d) < DOLT_ADD(%d) < DOLT_COMMIT(%d); events: %v",
+			commitIdx, doltAddIdx, doltCommitIdx, events)
+	}
+}
+
 // TestPostTxDoltCommitRetriesSerializationConflict pins the retry contract:
 // Dolt's rollback-guaranteed commit conflicts (1213/1205, 1105 autocommit
 // rollback) were retried when the dolt commit ran inside withRetryTx, and
@@ -401,7 +478,7 @@ func TestPostTxDoltCommitSurvivesCallerCancellation(t *testing.T) {
 	}
 }
 
-// TestAmbiguousTxCommitDoesNotMintDoltCommit pins the errCommitPhase
+// TestAmbiguousTxCommitDoesNotMintDoltCommit pins the ErrCommitIndeterminate
 // contract: a connection loss during the SQL COMMIT is ambiguous — and NO
 // post-tx dolt commit may be attempted off that error. In server mode the
 // branch working set is shared, so staging it after a commit that actually
@@ -424,8 +501,8 @@ func TestAmbiguousTxCommitDoesNotMintDoltCommit(t *testing.T) {
 	if err == nil {
 		t.Fatal("ambiguous commit loss must surface its error to the caller")
 	}
-	if !errors.Is(err, errCommitPhase) {
-		t.Fatalf("commit-phase connection loss must carry errCommitPhase, got: %v", err)
+	if !errors.Is(err, storage.ErrCommitIndeterminate) {
+		t.Fatalf("commit-phase connection loss must carry ErrCommitIndeterminate, got: %v", err)
 	}
 	for _, ev := range rec.snapshot() {
 		if strings.Contains(ev, "DOLT_ADD") || strings.Contains(ev, "DOLT_COMMIT") {

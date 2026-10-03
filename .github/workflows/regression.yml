@@ -5,7 +5,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # nexus/**: LatentLabsSpace fork integration line (default branch nexus/main).
+    branches: [main, 'release/**', 'nexus/**']
   # Allow manual trigger
   workflow_dispatch:
 
@@ -95,7 +96,7 @@ jobs:
           git config --global user.email "ci@beads.test"
 
       - name: Install Dolt
-        run: curl -fsSL https://github.com/dolthub/dolt/releases/latest/download/install.sh | sudo bash
+        run: ./scripts/ci/install-dolt.sh
 
       - name: Configure Dolt
         run: |

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
+
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 func TestCircuitBreaker_InitiallyAllows(t *testing.T) {
@@ -417,18 +420,32 @@ func TestCleanStaleCircuitBreakerFiles(t *testing.T) {
 }
 
 // TestCleanStaleCircuitBreakerFilesIn_LegacyRemovesClosed verifies that, in
-// legacy-directory mode (removeClosed=true), closed breaker files are swept
-// too — unlike the live directory. A closed sidecar in the abandoned legacy
-// "/tmp/beads-circuit" location (GH#4636) has no process left to reuse or
-// clean it: every successful circuit reset writes a closed file, and
-// ephemeral ports mint a distinct filename each time, so they would
-// otherwise accumulate there forever.
+// legacy-directory mode (removeClosed=true), closed breaker files ARE swept —
+// unlike the live directory — but only past the legacyClosedSweepTTL mtime
+// threshold. The legacy "/tmp/beads-circuit" location (GH#4636) is not fully
+// abandoned: TMPDIR-less processes (launchd, cron, bare ssh) resolve
+// os.TempDir() to /tmp and rewrite live closed state there on every success,
+// and the old unconditional remove churned against them forever — recreate,
+// delete, log, on every TMPDIR-set invocation (bd-uann8). A fresh closed file
+// is a live writer's state and must survive; an aged one is the GH#4636
+// ephemeral-port accumulation and must go.
 func TestCleanStaleCircuitBreakerFilesIn_LegacyRemovesClosed(t *testing.T) {
 	dir := t.TempDir()
 
-	closedFile := filepath.Join(dir, "beads-dolt-circuit-127-0-0-1-9999.json")
+	// A closed file no writer has touched past the TTL: the true GH#4636 case.
+	agedClosedFile := filepath.Join(dir, "beads-dolt-circuit-127-0-0-1-9999.json")
 	closedData, _ := json.Marshal(circuitState{State: circuitClosed})
-	if err := os.WriteFile(closedFile, closedData, 0600); err != nil {
+	if err := os.WriteFile(agedClosedFile, closedData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	aged := time.Now().Add(-legacyClosedSweepTTL - time.Hour)
+	if err := os.Chtimes(agedClosedFile, aged, aged); err != nil {
+		t.Fatal(err)
+	}
+
+	// A freshly-written closed file: a live TMPDIR-less writer's state.
+	freshClosedFile := filepath.Join(dir, "beads-dolt-circuit-127-0-0-1-8888.json")
+	if err := os.WriteFile(freshClosedFile, closedData, 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -442,8 +459,11 @@ func TestCleanStaleCircuitBreakerFilesIn_LegacyRemovesClosed(t *testing.T) {
 
 	cleanStaleCircuitBreakerFilesIn(dir, true)
 
-	if _, err := os.Stat(closedFile); !os.IsNotExist(err) {
-		t.Errorf("legacy closed breaker file should have been removed: %s", closedFile)
+	if _, err := os.Stat(agedClosedFile); !os.IsNotExist(err) {
+		t.Errorf("aged legacy closed breaker file should have been removed: %s", agedClosedFile)
+	}
+	if _, err := os.Stat(freshClosedFile); err != nil {
+		t.Errorf("fresh closed breaker file (live TMPDIR-less writer) should NOT have been removed: %s", freshClosedFile)
 	}
 	if _, err := os.Stat(freshFile); err != nil {
 		t.Errorf("fresh open breaker file should NOT have been removed: %s", freshFile)
@@ -593,6 +613,84 @@ func TestWithRetryTyped1105DoesNotRetryOrTripCircuit(t *testing.T) {
 	}
 	if state := breaker.State(); state != circuitClosed {
 		t.Fatalf("circuit state = %q, want %q", state, circuitClosed)
+	}
+}
+
+func TestRunInTransactionPermanentCallbackErrorsDoNotTripCircuit(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	breaker := newTestCircuitBreaker(t)
+	store := &DoltStore{breaker: breaker}
+	callbackErr := errors.New("invalid connection")
+	callbackCalls := 0
+	runnerCalls := 0
+
+	for i := 0; i < circuitFailureThreshold; i++ {
+		err := store.runInTransaction(context.Background(), "test: external callback", func(storage.Transaction) error {
+			callbackCalls++
+			return callbackErr
+		}, func(_ context.Context, _ string, fn func(storage.Transaction) error) error {
+			runnerCalls++
+			return fn(nil)
+		})
+		if !errors.Is(err, callbackErr) {
+			t.Fatalf("RunInTransaction attempt %d error = %v, want %v", i+1, err, callbackErr)
+		}
+	}
+
+	if callbackCalls != circuitFailureThreshold {
+		t.Fatalf("callback calls = %d, want %d", callbackCalls, circuitFailureThreshold)
+	}
+	if runnerCalls != circuitFailureThreshold {
+		t.Fatalf("transaction runner calls = %d, want %d", runnerCalls, circuitFailureThreshold)
+	}
+	if state := breaker.State(); state != circuitClosed {
+		t.Fatalf("circuit state after external callback errors = %q, want %q", state, circuitClosed)
+	}
+
+	unrelatedCalls := 0
+	if err := store.withRetry(context.Background(), func() error {
+		unrelatedCalls++
+		return nil
+	}); err != nil {
+		t.Fatalf("unrelated operation after callback errors: %v", err)
+	}
+	if unrelatedCalls != 1 {
+		t.Fatalf("unrelated operation calls = %d, want 1", unrelatedCalls)
+	}
+}
+
+func TestRunInTransactionPostCallbackIndeterminateFailureTripsCircuitWithoutReplay(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	breaker := newTestCircuitBreaker(t)
+	store := &DoltStore{breaker: breaker}
+	infraErr := fmt.Errorf("commit response lost: %w: %w", testConnectionLoss, ErrCommitIndeterminate)
+	callbackCalls := 0
+	runnerCalls := 0
+
+	for i := 0; i < circuitFailureThreshold; i++ {
+		err := store.runInTransaction(context.Background(), "test: infrastructure commit", func(storage.Transaction) error {
+			callbackCalls++
+			return nil
+		}, func(_ context.Context, _ string, fn func(storage.Transaction) error) error {
+			runnerCalls++
+			if err := fn(nil); err != nil {
+				return err
+			}
+			return infraErr
+		})
+		if !errors.Is(err, ErrCommitIndeterminate) {
+			t.Fatalf("RunInTransaction attempt %d error = %v, want ErrCommitIndeterminate", i+1, err)
+		}
+		if callbackCalls != i+1 {
+			t.Fatalf("callback calls after attempt %d = %d, want %d (no replay)", i+1, callbackCalls, i+1)
+		}
+		if runnerCalls != i+1 {
+			t.Fatalf("transaction runner calls after attempt %d = %d, want %d (no replay)", i+1, runnerCalls, i+1)
+		}
+	}
+
+	if state := breaker.State(); state != circuitOpen {
+		t.Fatalf("circuit state after infrastructure commit failures = %q, want %q", state, circuitOpen)
 	}
 }
 

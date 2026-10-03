@@ -21,7 +21,10 @@ on:
     paths:
       - 'cmd/bd/proxied_local_*'
       - 'cmd/bd/proxied_server*.go'
+      - 'cmd/bd/dolt*.go'
       - 'cmd/bd/*_proxied_server.go'
+      - 'cmd/bd/backup*.go'
+      - 'cmd/bd/purge*.go'
       - 'cmd/bd/db_proxy_child.go'
       - 'cmd/bd/init*.go'
       - 'cmd/bd/proxied_integration_helpers_test.go'
@@ -39,7 +42,10 @@ on:
     paths:
       - 'cmd/bd/proxied_local_*'
       - 'cmd/bd/proxied_server*.go'
+      - 'cmd/bd/dolt*.go'
       - 'cmd/bd/*_proxied_server.go'
+      - 'cmd/bd/backup*.go'
+      - 'cmd/bd/purge*.go'
       - 'cmd/bd/db_proxy_child.go'
       - 'cmd/bd/init*.go'
       - 'cmd/bd/proxied_integration_helpers_test.go'
@@ -65,8 +71,10 @@ jobs:
     env:
       CGO_ENABLED: "1"
       # Pinned so the lane tests a known dolt CLI, not whatever the installer
-      # resolves on a given day. Bump deliberately.
-      DOLT_VERSION: 2.2.2
+      # resolves on a given day. Bump deliberately, and only in lockstep with
+      # the measured pin in scripts/ci/install-dolt.sh (see "Which Dolt
+      # version to install" in docs/architecture/dolt.md).
+      DOLT_VERSION: 2.2.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -102,7 +110,17 @@ jobs:
             TestManagedLocalProxiedLegacyRecordFailClosed \
             TestManagedLocalProxiedOrphanBackendReaped \
             TestManagedLocalProxiedNProcessColdStartConvergence \
-            TestManagedLocalProxiedStopStartInterleave
+            TestManagedLocalProxiedStopStartInterleave \
+            TestManagedLocalProxiedDoltStatusReportsLiveTopology \
+            TestManagedLocalProxiedDoltStartRefusesOverLiveProxy \
+            TestManagedLocalProxiedDoltStartRefusesWithProxyDown \
+            TestManagedLocalProxiedDoltLifecycleLeavesOtherTopologiesAlone \
+            TestManagedLocalProxiedPurgeWispsPlaneRetention \
+            TestManagedLocalProxiedCapabilityMatrix \
+            TestManagedLocalProxiedBackupRoundTrip \
+            TestManagedLocalProxiedAutoBackup \
+            TestManagedLocalProxiedBackupRestoreRefusedWhileAttached \
+            TestManagedLocalProxiedBackendCleanExitRetiresProxy
           do
             if ! grep -qx "$test_name" <<<"$listed"; then
               echo "managed-local lifecycle test $test_name is missing; got: '$listed'" >&2

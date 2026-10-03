@@ -23,26 +23,34 @@ import (
 // this. Routes ephemeral IDs to the wisps table (no DOLT_COMMIT); permanent
 // issues get a Dolt commit.
 func (s *DoltStore) MergeMetadata(ctx context.Context, issueID, key string, value json.RawMessage, actor string) error {
-	// Route ephemeral IDs to wisps table (falls through for promoted wisps).
-	// Wisps skip DOLT_COMMIT since they live in dolt_ignored tables.
-	if s.isActiveWisp(ctx, issueID) {
-		return s.mergeMetadataWisp(ctx, issueID, key, value, actor)
-	}
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		// Route ephemeral IDs to wisps table (falls through for promoted wisps).
+		// Wisps skip DOLT_COMMIT since they live in dolt_ignored tables.
+		if s.isActiveWisp(ctx, issueID) {
+			return s.mergeMetadataWisp(ctx, issueID, key, value, actor)
+		}
 
-	// withRetryTx owns BeginTx and the final Commit. The read+merge+write inside
-	// the fn is a single transaction; the retry is what fixes the cross-tx
-	// clobber the old SlotSet suffered from.
-	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
-		return issueops.MergeMetadataInTx(ctx, tx, issueID, key, value, actor)
-	}); err != nil {
-		return err
-	}
-	// Post-tx Dolt commit (NEXUS#92 ordering). The merge routes through
-	// UpdateIssueInTx, which also writes an EventUpdated row into events,
-	// so stage both tables (mirrors CloseIssue).
-	s.doltCommitAfterTx(ctx, []string{"issues", "events"},
-		fmt.Sprintf("bd: merge metadata %s.%s", issueID, key))
-	return nil
+		// withRetryTx owns BeginTx and the final Commit. The read+merge+write inside
+		// the fn is a single transaction; the retry is what fixes the cross-tx
+		// clobber the old SlotSet suffered from.
+		var pc postTxCommit
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			pc = postTxCommit{}
+			if err := issueops.MergeMetadataInTx(ctx, tx, issueID, key, value, actor); err != nil {
+				return err
+			}
+
+			// Dolt versioning for permanent issues. The merge routes through
+			// UpdateIssueInTx, which also writes an EventUpdated row into events, so
+			// stage both tables, committed after the SQL commit (mirrors CloseIssue).
+			pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: merge metadata %s.%s", issueID, key))
+			return nil
+		}); err != nil {
+			return err
+		}
+		s.publishPostTx(ctx, pc)
+		return nil
+	})
 }
 
 // mergeMetadataWisp merges a metadata key on a wisp. Mirrors closeWisp: no Dolt
@@ -55,10 +63,16 @@ func (s *DoltStore) mergeMetadataWisp(ctx context.Context, issueID, key string, 
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
+
 	if err := issueops.MergeMetadataInTx(ctx, tx, issueID, key, value, actor); err != nil {
 		return err
 	}
-	return wrapTransactionError("commit merge metadata wisp", tx.Commit())
+	if err := s.commitSQLTx(ctx, "commit merge metadata wisp", tx); err != nil {
+		return err
+	}
+	return nil
 }
 
 // SlotSet sets a key-value pair in the issue's metadata JSON.
@@ -120,23 +134,31 @@ func (s *DoltStore) SlotGet(ctx context.Context, issueID, key string) (string, e
 // longer clobber this write between the read and the write. Clearing an absent
 // key is a no-op that writes nothing.
 func (s *DoltStore) SlotClear(ctx context.Context, issueID, key, actor string) error {
-	// Route ephemeral IDs to wisps table (falls through for promoted wisps).
-	// Wisps skip DOLT_COMMIT since they live in dolt_ignored tables.
-	if s.isActiveWisp(ctx, issueID) {
-		return s.clearMetadataWisp(ctx, issueID, key, actor)
-	}
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		// Route ephemeral IDs to wisps table (falls through for promoted wisps).
+		// Wisps skip DOLT_COMMIT since they live in dolt_ignored tables.
+		if s.isActiveWisp(ctx, issueID) {
+			return s.clearMetadataWisp(ctx, issueID, key, actor)
+		}
 
-	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
-		return issueops.DeleteMetadataInTx(ctx, tx, issueID, key, actor)
-	}); err != nil {
-		return err
-	}
-	// Post-tx Dolt commit (NEXUS#92 ordering). DeleteMetadataInTx routes
-	// through UpdateIssueInTx (issues + events); a no-op clear degrades to
-	// nothing-to-commit inside the helper.
-	s.doltCommitAfterTx(ctx, []string{"issues", "events"},
-		fmt.Sprintf("bd: clear metadata %s.%s", issueID, key))
-	return nil
+		var pc postTxCommit
+		if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			pc = postTxCommit{}
+			if err := issueops.DeleteMetadataInTx(ctx, tx, issueID, key, actor); err != nil {
+				return err
+			}
+
+			// DeleteMetadataInTx routes through UpdateIssueInTx (issues + events),
+			// so stage both. A no-op clear writes nothing, which the post-tx
+			// staged-set guard skips (nothing to commit).
+			pc.stage([]string{"issues", "events"}, fmt.Sprintf("bd: clear metadata %s.%s", issueID, key))
+			return nil
+		}); err != nil {
+			return err
+		}
+		s.publishPostTx(ctx, pc)
+		return nil
+	})
 }
 
 // clearMetadataWisp clears a metadata key on a wisp. Mirrors mergeMetadataWisp /
@@ -148,8 +170,14 @@ func (s *DoltStore) clearMetadataWisp(ctx context.Context, issueID, key, actor s
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
+
 	if err := issueops.DeleteMetadataInTx(ctx, tx, issueID, key, actor); err != nil {
 		return err
 	}
-	return wrapTransactionError("commit clear metadata wisp", tx.Commit())
+	if err := s.commitSQLTx(ctx, "commit clear metadata wisp", tx); err != nil {
+		return err
+	}
+	return nil
 }

@@ -26,20 +26,35 @@ type readyScopeField struct {
 // intersection: fields the builder copies onto the filter and the projection
 // then discards.
 //
-// Three groups are deliberately ABSENT, because listing them here would refuse
+// Four groups are deliberately ABSENT, because listing them here would refuse
 // requests that are answered correctly today:
 //
-//   - What the projection carries: IssueType, all five label forms, Assignee,
+//   - What the projection carries: Status/Statuses (GH#5832), IssueType, all five label forms, Assignee,
 //     NoAssignee, the exact Priority, ParentID, MolType, WispType,
 //     MetadataFields, HasMetadataKey, ExcludeTypes (and with it IncludeGates
-//     and IncludeInfra's type suppression), Limit, Offset and MaxRows.
+//     and IncludeInfra's type suppression), IncludeEphemeral (and with it
+//     IncludeInfra's plane half, which the ready query admits through its own
+//     ephemeral gate), Limit, Offset, and the MaxRows cap with its
+//     attribution.
 //
-//   - Status and AllFlag. The builder resolves both to "open" under ReadyFlag
-//     before the projection ever runs, so IssueFilter.Statuses is never
-//     populated on this path and there is nothing for the projection to drop.
-//     Ready work is open work; that override is pinned by the builder's golden
-//     file (internal/workapi/testdata/list_filter_golden.json,
-//     ready_flag_overrides_status).
+//   - THE HYDRATION KNOBS, SkipLabels and SkipCounts. They are the one group
+//     the "exactly the intersection" rule above would otherwise sweep in: the
+//     builder does copy them onto the filter and the projection does discard
+//     them. They stay out because they select what is HYDRATED rather than
+//     which rows match, so a ReadyFlag request that sets one is answered with
+//     the rows it asked for and merely pays for a column it did not want.
+//     Refusing that would be refusing a correct answer over its cost, and the
+//     promise is already stated where a caller reads it (ListRequest.ReadyFlag).
+//
+//   - AllFlag, and `--status all`. The builder resolves both to "open" under
+//     ReadyFlag before the projection ever runs (`all` is the no-filter
+//     spelling). An explicit --status is carried: BuildListFilter writes it
+//     onto IssueFilter and ReadyFilterFromIssueFilter copies Status/Statuses
+//     onto the ready-work filter, so `bd list --status X --ready` is the
+//     intersection rather than the unfiltered ready set (GH#5832). Status is
+//     therefore ABSENT from this drop set because it is honored, not because
+//     it is overridden. The default-open pin is the golden
+//     `ready_flag` case; the honor path is `ready_flag_honors_status`.
 //
 //   - NoPinnedFlag. Pinned is dropped by the projection, but the ready-work
 //     WHERE clause excludes pinned rows unconditionally
@@ -79,9 +94,11 @@ var readyScopeFields = []readyScopeField{
 	{"PriorityMin", "--priority-min", func(r ListRequest) bool { return r.PriorityMin != nil }},
 	{"PriorityMax", "--priority-max", func(r ListRequest) bool { return r.PriorityMax != nil }},
 
-	// The keyset position is a pair and only the timestamp half decides
-	// whether one was supplied; AfterID alone is not a position.
-	{"AfterCreatedAt/AfterID", "cursor", func(r ListRequest) bool { return r.AfterCreatedAt != nil }},
+	// The keyset position is a tuple and only the timestamp half decides
+	// whether one was supplied; neither AfterID nor AfterPriority alone is a
+	// position. All three are named in the refusal because a caller who dropped
+	// only the ones named would still be sending part of a position.
+	{"AfterCreatedAt/AfterID/AfterPriority", "cursor", func(r ListRequest) bool { return r.AfterCreatedAt != nil }},
 }
 
 // ValidateReadyFlagScope refuses a list request that combines ReadyFlag with a
