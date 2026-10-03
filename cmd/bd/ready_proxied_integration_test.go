@@ -228,10 +228,14 @@ func TestProxiedServerReady(t *testing.T) {
 		if envelope.Pagination.Returned != 2 {
 			t.Errorf("pagination.returned = %d, want 2", envelope.Pagination.Returned)
 		}
-		// Total is unavailable on the proxied backend; omitempty must drop
-		// the key rather than emit a false "total": 0.
-		if strings.Contains(s[start:], `"total"`) {
-			t.Errorf("unexpected 'total' key in proxied pagination (unavailable on this backend): %s", s[start:])
+		// Total is PUBLISHED here, which it was not before the ReadyCounter
+		// role: this route had no way to size the ready set, so the direct
+		// route's "total" simply had no proxied counterpart and a script that
+		// read it got nothing under a proxied workspace. Four rows were seeded
+		// and two returned.
+		if envelope.Pagination.Total != 4 {
+			t.Errorf("pagination.total = %d, want the 4 rows this case seeded: %s",
+				envelope.Pagination.Total, s[start:])
 		}
 	})
 
@@ -663,29 +667,18 @@ func TestProxiedServerReady2(t *testing.T) {
 			t.Errorf("expected BEADS_MAX_ROWS proxied-server rejection for bulk ready, got: %s", out)
 		}
 
+		before := bdProxiedReadyJSON(t, bd, p, "--label", "rcmr-claim")
 		stdout, stderr, err = bdProxiedRunBuffersWithEnv(t, bd, p.dir,
 			[]string{"BEADS_MAX_ROWS=1"}, "ready", "--claim", "--json", "--label", "rcmr-claim")
-		if err != nil {
-			t.Fatalf("bd ready --claim --json under BEADS_MAX_ROWS=1 should succeed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		if err == nil {
+			t.Fatalf("bd ready --claim --json under BEADS_MAX_ROWS=1 should refuse")
 		}
-		var claimed []types.IssueWithCounts
-		s := strings.TrimSpace(stdout)
-		start := strings.Index(s, "[")
-		if start < 0 {
-			t.Fatalf("no JSON array in claim output:\n%s", stdout)
+		if out := stdout + stderr; !strings.Contains(out, "not supported in proxied-server mode") {
+			t.Fatalf("expected cap refusal, got:\n%s", out)
 		}
-		if err := json.Unmarshal([]byte(s[start:]), &claimed); err != nil {
-			t.Fatalf("parse claim JSON: %v\n%s", err, s[start:])
-		}
-		if len(claimed) != 1 {
-			t.Fatalf("expected exactly one claimed issue, got %d: %s", len(claimed), stdout)
-		}
-		if claimed[0].Status != types.StatusInProgress {
-			t.Errorf("Status = %s, want %s", claimed[0].Status, types.StatusInProgress)
-		}
-		persisted := bdProxiedShow(t, bd, p.dir, claimed[0].ID)
-		if persisted.Status != types.StatusInProgress || persisted.Assignee == "" {
-			t.Errorf("persisted claim = %+v, want in_progress with assignee", persisted)
+		after := bdProxiedReadyJSON(t, bd, p, "--label", "rcmr-claim")
+		if len(after) != len(before) {
+			t.Fatalf("claim refusal mutated ready set: before=%d after=%d", len(before), len(after))
 		}
 	})
 }

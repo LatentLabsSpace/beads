@@ -42,10 +42,11 @@ func TestIsYamlOnlyKey(t *testing.T) {
 		{"backup.git-repo", true},
 		{"backup.future-key", true}, // prefix match
 
-		// Import settings
+		// Import settings. import.* is exact-match, not a prefix namespace:
+		// an unlisted import.* key must not be treated as yaml-only.
 		{"import.auto", true},
 		{"import.path", true},
-		{"import.orphan_handling", false},
+		{"import.unlisted-key", false},
 
 		// Secret keys (stored in yaml to avoid leaking via Dolt push)
 		{"github.token", true},
@@ -272,26 +273,6 @@ func TestFormatYamlValue(t *testing.T) {
 	}
 }
 
-func TestNormalizeYamlKey(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"no-db", "no-db"},               // no alias, unchanged
-		{"json", "json"},                 // no alias, unchanged
-		{"routing.mode", "routing.mode"}, // no alias for this one
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := normalizeYamlKey(tt.input)
-			if got != tt.expected {
-				t.Errorf("normalizeYamlKey(%q) = %q, want %q", tt.input, got, tt.expected)
-			}
-		})
-	}
-}
-
 func TestSetYamlConfig(t *testing.T) {
 	oldBeadsDir := os.Getenv("BEADS_DIR")
 	if err := os.Unsetenv("BEADS_DIR"); err != nil {
@@ -405,6 +386,53 @@ func TestSetYamlConfigInDir_WritesTargetConfigDespiteLocalStub(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(worktreeDir, ".beads", "config.yaml")); !os.IsNotExist(err) {
 		t.Fatalf("expected worktree stub to remain untouched, got err=%v", err)
+	}
+}
+
+func TestWorkspaceYamlValueStrictDistinguishesMissingAndMalformed(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if value, present, err := WorkspaceYamlValueStrict(beadsDir, "dolt.shared-server"); err != nil || present || value != "" {
+		t.Fatalf("missing config = (%q, %v, %v), want empty/false/nil", value, present, err)
+	}
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("dolt: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := WorkspaceYamlValueStrict(beadsDir, "dolt.shared-server"); err == nil {
+		t.Fatal("malformed config should return an error")
+	}
+}
+
+func TestWorkspaceYamlValueStrictReadsNestedScalar(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("dolt:\n  shared-server: false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	value, present, err := WorkspaceYamlValueStrict(beadsDir, "dolt.shared-server")
+	if err != nil || !present || value != "false" {
+		t.Fatalf("nested scalar = (%q, %v, %v), want false/true/nil", value, present, err)
+	}
+}
+
+func TestWorkspaceYamlValueStrictRejectsNullAndWrongParent(t *testing.T) {
+	for _, body := range []string{"dolt:\n  shared-server: null\n", "dolt: false\n", "dolt: []\n"} {
+		t.Run(strings.ReplaceAll(body, "\n", "_"), func(t *testing.T) {
+			beadsDir := filepath.Join(t.TempDir(), ".beads")
+			if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := WorkspaceYamlValueStrict(beadsDir, "dolt.shared-server"); err == nil {
+				t.Fatalf("config %q should be rejected", body)
+			}
+		})
 	}
 }
 
@@ -780,11 +808,38 @@ func TestIsSecretKey(t *testing.T) {
 		{"some.secret", true},
 		{"some.api-key", true},
 
+		// Spellings the wire redaction has to cover. GET /v0/beads/config
+		// publishes a value for any key this returns false for, and bd serve's
+		// bearer — optional, and shared and surface-wide where it is
+		// configured — cannot withhold one value from one caller, so each of
+		// these is a credential in cleartext if it regresses. "apikey" in
+		// particular is the spelling the published schema promises is covered.
+		{"integrations.apikey", true},
+		{"github.pat", true},
+		{"github.auth", true},
+		{"db.pwd", true},
+		{"db.passwd", true},
+		{"ssh.key", true},
+		{"registry.bearer", true},
+		{"aws.credentials", true},
+		{"tls.cert", true},
+		{"signing.private_key", true},
+
 		{"no-db", false},
 		{"json", false},
 		{"routing.mode", false},
 		{"sync.remote", false},
 		{"linear.team_id", false},
+
+		// The near misses that make the short spellings SEGMENT matches rather
+		// than substring matches. Redacting these would be a bug in the other
+		// direction: every one is an ordinary key that merely starts with a
+		// sensitive word.
+		{"issue.path", false},
+		{"export.pattern", false},
+		{"commit.author", false},
+		{"sort.keyword", false},
+		{"build.compat", false},
 	}
 
 	for _, tt := range tests {

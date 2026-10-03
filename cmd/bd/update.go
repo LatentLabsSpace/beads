@@ -71,7 +71,11 @@ var updateCmd = &cobra.Command{
 	Long: `Update one or more issues.
 
 If no issue ID is provided, updates the last touched issue (from most recent
-create, update, show, or close operation).
+create, update, show, or close operation). This fallback only applies in
+interactive sessions (stdin is a terminal); in scripts and agent sessions a
+missing ID is an error, so a command built from an empty variable cannot
+silently mutate an unrelated issue. Set BD_LAST_TOUCHED_FALLBACK=1 to allow
+the fallback anywhere, or =0 to disable it entirely.
 
 Updates are applied per issue ID, not atomically across IDs: when some IDs
 fail, the remaining issues are still updated, every failed ID is reported on
@@ -81,11 +85,21 @@ Exit codes: 1 for general failures; 13 when every failure is a stale
 --if-assignee/--if-status guard (the precondition no longer held, nothing was
 written — another actor won the race, so retrying the same guard is
 pointless).`,
-	Args:          cobra.MinimumNArgs(0),
+	// The non-interactive no-ID refusal lives in argument validation, which
+	// cobra runs before root's PersistentPreRunE — so a scripted `bd update
+	// $ID ...` with an empty $ID fails fast, before the pre-run hooks can
+	// open the store, run a version-bump migration, or auto-import JSONL
+	// (bd-m00pb). The interactive fallback itself is resolved in RunE.
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 && !AllowLastTouchedFallback() {
+			return HandleErrorRespectJSON("no issue ID provided (the last-touched fallback only applies in interactive sessions; pass an explicit issue ID or set BD_LAST_TOUCHED_FALLBACK=1)")
+		}
+		return nil
+	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		CheckReadonly("update")
+		CheckReadonly("update") // also covers the migration freeze check (dc-6jaq)
 
 		evt := metrics.NewCommandEvent("update")
 		defer func() {
@@ -94,11 +108,19 @@ pointless).`,
 			}
 		}()
 
+		// Refuse a mis-typed flag value that cobra parsed as a positional issue
+		// id, before any write path (direct or proxied) can apply a partial
+		// update. See bd-5247.
+		if err := errStrayFlagValuePositional(args); err != nil {
+			return HandleErrorRespectJSON("%s", err)
+		}
+
 		if usesProxiedServer() {
 			return runUpdateProxiedServer(cmd, rootCtx, args)
 		}
 
-		// If no IDs provided, use last touched issue
+		// If no IDs provided, use last touched issue (interactive only;
+		// the non-interactive case was already refused in Args validation)
 		if len(args) == 0 {
 			lastTouched := GetLastTouchedID()
 			if lastTouched == "" {
@@ -231,15 +253,19 @@ pointless).`,
 		}
 		if cmd.Flags().Changed("add-label") {
 			addLabels, _ := cmd.Flags().GetStringSlice("add-label")
-			updates["add_labels"] = addLabels
+			added := utils.NormalizeLabels(addLabels)
+			warnLabelsContainingWhitespace(added)
+			updates["add_labels"] = added
 		}
 		if cmd.Flags().Changed("remove-label") {
 			removeLabels, _ := cmd.Flags().GetStringSlice("remove-label")
-			updates["remove_labels"] = removeLabels
+			updates["remove_labels"] = utils.NormalizeLabels(removeLabels)
 		}
 		if cmd.Flags().Changed("set-labels") {
 			setLabels, _ := cmd.Flags().GetStringSlice("set-labels")
-			updates["set_labels"] = setLabels
+			set := utils.NormalizeLabels(setLabels)
+			warnLabelsContainingWhitespace(set)
+			updates["set_labels"] = set
 		}
 		if cmd.Flags().Changed("parent") {
 			parent, _ := cmd.Flags().GetString("parent")
@@ -282,7 +308,7 @@ pointless).`,
 				inPast := t.Before(time.Now())
 				if inPast && !jsonOutput {
 					fmt.Fprintf(os.Stderr, "%s Defer date %q is in the past. Issue will appear in bd ready immediately.\n",
-						ui.RenderWarn("!"), t.Format("2006-01-02 15:04"))
+						ui.RenderWarn("!"), t.Local().Format("2006-01-02 15:04"))
 					fmt.Fprintf(os.Stderr, "  Did you mean a future date? Use --defer=+1h or --defer=tomorrow\n")
 				}
 				updates["defer_until"] = t
@@ -764,7 +790,8 @@ func optionalTimeField(value any) (issueops.Field[*time.Time], bool) {
 
 // parseSetMetadataFlags splits --set-metadata key=value pairs, matching
 // storage.ApplyMetadataEdits' parsing so the CLI contract is unchanged. Values
-// are always stored as JSON strings (GH#4146).
+// are typed by storage.MetadataEditValue, which infers null/bool/number from
+// the spelling and falls back to a string.
 func parseSetMetadataFlags(flags []string) (map[string]json.RawMessage, error) {
 	set := make(map[string]json.RawMessage, len(flags))
 	for _, flag := range flags {
@@ -810,6 +837,21 @@ type updateIDFailure struct {
 	ID            string `json:"id"`
 	Error         string `json:"error"`
 	GuardMismatch bool   `json:"guard_mismatch,omitempty"`
+}
+
+// errStrayFlagValuePositional refuses, before any write, a positional argument
+// that contains '='. --set-metadata takes ONE key=value per flag, so
+// `--set-metadata a=1 b=2` silently turns `b=2` into a positional issue id;
+// no issue id contains '=', so such a positional is unambiguously a mis-typed
+// flag value. Rejecting it up front prevents a partial write that would apply
+// only the pairs that happened to bind to a flag (bd-5247).
+func errStrayFlagValuePositional(args []string) error {
+	for _, arg := range args {
+		if strings.Contains(arg, "=") {
+			return fmt.Errorf("positional argument %q contains '=', which no issue id does — this is a mis-typed flag value; repeat the flag per pair, e.g. --set-metadata a=1 --set-metadata b=2", arg)
+		}
+	}
+	return nil
 }
 
 // reportUpdateFailures emits a per-ID failure report on stderr and returns a
@@ -876,9 +918,10 @@ func applyMetadataEdits(existing json.RawMessage, setFlags, unsetFlags []string)
 	return storage.ApplyMetadataEdits(existing, setFlags, unsetFlags)
 }
 
-// toJSONValue stores a CLI metadata value as a JSON string.
-// Previous behavior inferred types (numbers, booleans) from content,
-// which silently broke map[string]string round-trips (GH#4146).
+// toJSONValue converts a CLI metadata value to its most appropriate JSON
+// representation: numbers, booleans and null keep their type, everything else
+// becomes a JSON string.
+// Thin alias over the shared storage helper (also used in-transaction by issueops).
 func toJSONValue(s string) json.RawMessage {
 	return storage.MetadataEditValue(s)
 }
@@ -970,7 +1013,7 @@ func init() {
 	//   --defer=+1h         Hidden from bd ready for 1 hour
 	//   --defer=""          Clear defer (show in bd ready immediately)
 	updateCmd.Flags().String("due", "", "Due date/time (empty to clear). Formats: +6h, +1d, +2w, tomorrow, next monday, 2025-01-15")
-	updateCmd.Flags().String("defer", "", "Defer until date (empty to clear). Issue hidden from bd ready until then")
+	updateCmd.Flags().String("defer", "", "Defer until date (empty to clear). Issue hidden from bd ready until then, then auto-wakes to open")
 	// Gate fields (bd-z6kw)
 	updateCmd.Flags().String("await-id", "", "Set gate await_id (e.g., GitHub run ID for gh:run gates)")
 	// Ephemeral/persistent flags

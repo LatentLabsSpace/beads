@@ -24,6 +24,14 @@ var YamlOnlyKeys = map[string]bool{
 	// Bootstrap flags (affect how bd starts)
 	"no-db": true,
 	"json":  true,
+	// Events journal: read through viper during root pre-run, before the store
+	// is open, so a DB-backed write would be silently unread — the GH#536 class
+	// this map exists to prevent. Without these four entries
+	// `bd config set events-journal true` reports success and changes nothing.
+	"events-journal":             true,
+	"events-journal-retain-days": true,
+	"events-journal-retain-rows": true,
+	"events-journal-auto-prune":  true,
 
 	// Database and identity
 	"db":       true,
@@ -107,7 +115,7 @@ func IsYamlOnlyKey(key string) bool {
 	}
 
 	// Check prefix matches for nested keys
-	prefixes := []string{"routing.", "sync.", "git.", "directory.", "repos.", "external_projects.", "validation.", "hierarchy.", "ai.", "backup.", "export.", "dolt.", "federation.", "metrics.", "list.", "audit.", "storage-class."}
+	prefixes := []string{"routing.", "sync.", "git.", "directory.", "repos.", "external_projects.", "validation.", "lint.", "hierarchy.", "ai.", "backup.", "export.", "dolt.", "federation.", "metrics.", "list.", "audit.", "storage-class."}
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(key, prefix) {
 			return true
@@ -117,16 +125,53 @@ func IsYamlOnlyKey(key string) bool {
 	return false
 }
 
-// secretKeyPatterns are substrings that identify a yaml-only key as containing
-// sensitive material that should not be written to git-tracked files.
-var secretKeyPatterns = []string{"api_key", "api-key", "secret", "token", "password"}
+// secretKeyPatterns are substrings that identify a key as carrying sensitive
+// material. Matched anywhere in the key, so they must be long enough that a
+// substring hit is never an accident.
+var secretKeyPatterns = []string{
+	"api_key", "api-key", "apikey", "secret", "token", "password", "passwd",
+	"credential", "private_key", "privatekey", "privkey",
+}
 
-// IsSecretKey returns true if the given config key holds sensitive material
-// (API keys, tokens, passwords) that should not be committed to git.
+// secretKeySegments are whole segments — split on `.`, `_` and `-` — that mark
+// a key as sensitive.
+//
+// They are matched as SEGMENTS rather than as substrings because every one of
+// them is a prefix of an ordinary word: as a substring, "pat" would redact
+// `issue.path` and `export.pattern`, "auth" would redact `commit.author`, and
+// "key" would redact `sort.keyword`. As a segment, `github.pat` and
+// `commit.author` are told apart correctly.
+var secretKeySegments = map[string]bool{
+	"key": true, "keys": true, "apikey": true, "pwd": true, "pat": true,
+	"auth": true, "bearer": true, "cert": true, "credential": true,
+	"credentials": true, "secret": true, "token": true, "password": true,
+}
+
+// IsSecretKey reports whether a config key holds sensitive material.
+//
+// IT IS A SECURITY CONTROL, not only a lint. Two callers depend on it: the
+// `bd config set` guard that refuses to write a credential into a git-tracked
+// file, and — since the settings surface went on the wire — the redaction in
+// internal/httpapi that decides whether GET /v0/beads/config publishes a
+// value. Redaction is the whole control there: a `bd serve` bearer is optional
+// and, where configured, shared and surface-wide, so it cannot withhold one
+// value from one caller — and there is no TLS either. A spelling missing from
+// this predicate is a credential served in cleartext.
+//
+// It errs toward over-redacting for that reason: a key wrongly withheld is an
+// operator asking why, and a key wrongly published cannot be recalled. The
+// decision is about the KEY alone; no value is ever inspected.
 func IsSecretKey(key string) bool {
 	lower := strings.ToLower(key)
 	for _, pattern := range secretKeyPatterns {
 		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	for _, segment := range strings.FieldsFunc(lower, func(r rune) bool {
+		return r == '.' || r == '_' || r == '-'
+	}) {
+		if secretKeySegments[segment] {
 			return true
 		}
 	}
@@ -202,23 +247,8 @@ func checkSecretGitTracked(configPath, key string) error {
 	)
 }
 
-// keyAliases maps alternative key names to their canonical yaml form.
-// This ensures consistency when users use different formats (dot vs hyphen).
-var keyAliases = map[string]string{}
-
-// normalizeYamlKey converts a key to its canonical yaml format.
-// Some keys have aliases (e.g., sync.branch -> sync-branch) to handle
-// different input formats consistently.
-func normalizeYamlKey(key string) string {
-	if canonical, ok := keyAliases[key]; ok {
-		return canonical
-	}
-	return key
-}
-
 // SetYamlConfig sets a configuration value in the project's config.yaml file.
 // It handles both adding new keys and updating existing (possibly commented) keys.
-// Keys are normalized to their canonical yaml format (e.g., sync.branch -> sync-branch).
 func SetYamlConfig(key, value string) error {
 	// Validate specific keys (GH#995)
 	if err := validateYamlConfigValue(key, value); err != nil {
@@ -296,8 +326,94 @@ func IsUserGlobalKey(key string) bool {
 // never re-enable metrics for a user who opted out, nor redirect where metrics
 // are sent. See MetricsDisabledByUserConfig / UserMetricsEndpoint.
 func readUserGlobalYamlValue(key string) (string, bool) {
-	path := UserConfigYamlPath()
-	data, err := os.ReadFile(path) //nolint:gosec // path is the user-global config path from UserConfigYamlPath
+	configPath, err := UserConfigYamlPath()
+	if err != nil {
+		return "", false
+	}
+	return readYamlValueAtPath(configPath, key)
+}
+
+// WorkspaceYamlValue reads a single dotted key out of ONE workspace's
+// config.yaml, named by its .beads directory, returning ("", false) when the
+// file or the key is absent.
+//
+// It exists for the cross-workspace opens — routed creates, remote-cache
+// hydration, `bd serve` against another workspace — where the process-wide
+// merged config answers for the directory bd was LAUNCHED from, not for the
+// workspace about to be written. A setting that governs what gets recorded in a
+// target workspace has to be read from that target.
+func WorkspaceYamlValue(beadsDir, key string) (string, bool) {
+	if beadsDir == "" {
+		return "", false
+	}
+	return readYamlValueAtPath(filepath.Join(beadsDir, "config.yaml"), key)
+}
+
+// WorkspaceYamlValueStrict reads one dotted key from a workspace config.yaml
+// without conflating a malformed or unreadable file with an absent key. A
+// missing file or key returns present=false and no error; all other I/O and
+// YAML shape errors are returned to the caller.
+func WorkspaceYamlValueStrict(beadsDir, key string) (value string, present bool, err error) {
+	if beadsDir == "" {
+		return "", false, nil
+	}
+	data, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml")) //nolint:gosec // beadsDir is caller-resolved workspace state
+	if os.IsNotExist(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("reading workspace config.yaml: %w", err)
+	}
+	var root map[string]interface{}
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return "", false, fmt.Errorf("parsing workspace config.yaml: %w", err)
+	}
+	if root == nil {
+		return "", false, nil
+	}
+	if raw, ok := root[key]; ok {
+		value, err := strictYamlScalarString(raw)
+		if err != nil {
+			return "", true, err
+		}
+		return value, true, nil
+	}
+	var node interface{} = root
+	parts := strings.Split(key, ".")
+	for i, part := range parts {
+		m, ok := node.(map[string]interface{})
+		if !ok {
+			return "", true, fmt.Errorf("workspace config key %q has a non-map parent", key)
+		}
+		node, ok = m[part]
+		if !ok {
+			return "", false, nil
+		}
+		if i == len(parts)-1 {
+			value, err := strictYamlScalarString(node)
+			if err != nil {
+				return "", true, err
+			}
+			return value, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func strictYamlScalarString(v interface{}) (string, error) {
+	if v == nil {
+		return "", fmt.Errorf("workspace config value is null")
+	}
+	switch v.(type) {
+	case map[string]interface{}, []interface{}:
+		return "", fmt.Errorf("workspace config value must be a scalar")
+	default:
+		return fmt.Sprintf("%v", v), nil
+	}
+}
+
+func readYamlValueAtPath(path, key string) (string, bool) {
+	data, err := os.ReadFile(path) //nolint:gosec // path is a resolved config.yaml path, not user input
 	if err != nil {
 		return "", false
 	}
@@ -389,10 +505,11 @@ func MetricsNoticeShownByUserConfig() bool {
 }
 
 func UnsetUserYamlConfig(key string) error {
-	configPath := UserConfigYamlPath()
-	normalizedKey := normalizeYamlKey(key)
-
-	content, err := os.ReadFile(configPath) //nolint:gosec // configPath is from UserConfigYamlPath
+	configPath, err := UserConfigYamlPath()
+	if err != nil {
+		return err
+	}
+	content, err := os.ReadFile(configPath) //nolint:gosec // configPath is a validated absolute user config path
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -400,7 +517,7 @@ func UnsetUserYamlConfig(key string) error {
 		return fmt.Errorf("failed to read user config.yaml: %w", err)
 	}
 
-	newContent := commentOutYamlKey(string(content), normalizedKey)
+	newContent := commentOutYamlKey(string(content), key)
 
 	// Preserve the owner-private 0600 posture every other user-global writer
 	// uses (SetUserYamlConfig, setYamlConfigAtPath, the metrics bootstrap);
@@ -416,7 +533,10 @@ func SetUserYamlConfig(key, value string) error {
 	if err := validateYamlConfigValue(key, value); err != nil {
 		return err
 	}
-	configPath := UserConfigYamlPath()
+	configPath, err := UserConfigYamlPath()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		return fmt.Errorf("failed to create user config directory: %w", err)
 	}
@@ -431,10 +551,6 @@ func SetUserYamlConfig(key, value string) error {
 }
 
 func setYamlConfigAtPath(configPath, key, value string) error {
-
-	// Normalize key to canonical yaml format
-	normalizedKey := normalizeYamlKey(key)
-
 	// Read existing config
 	content, err := os.ReadFile(configPath) //nolint:gosec // configPath is from findProjectConfigYaml
 	if err != nil {
@@ -442,7 +558,7 @@ func setYamlConfigAtPath(configPath, key, value string) error {
 	}
 
 	// Update or add the key
-	newContent, err := updateYamlKey(string(content), normalizedKey, value)
+	newContent, err := updateYamlKey(string(content), key, value)
 	if err != nil {
 		return err
 	}
@@ -457,13 +573,11 @@ func setYamlConfigAtPath(configPath, key, value string) error {
 
 // GetYamlConfig gets a configuration value from config.yaml.
 // Returns empty string if key is not found or is commented out.
-// Keys are normalized to their canonical yaml format (e.g., sync.branch -> sync-branch).
 func GetYamlConfig(key string) string {
 	if v == nil {
 		return ""
 	}
-	normalizedKey := normalizeYamlKey(key)
-	return v.GetString(normalizedKey)
+	return v.GetString(key)
 }
 
 // UnsetYamlConfig removes a configuration value from the project's config.yaml file.
@@ -474,14 +588,12 @@ func UnsetYamlConfig(key string) error {
 		return err
 	}
 
-	normalizedKey := normalizeYamlKey(key)
-
 	content, err := os.ReadFile(configPath) //nolint:gosec // configPath is from findProjectConfigYaml
 	if err != nil {
 		return fmt.Errorf("failed to read config.yaml: %w", err)
 	}
 
-	newContent := commentOutYamlKey(string(content), normalizedKey)
+	newContent := commentOutYamlKey(string(content), key)
 
 	if err := os.WriteFile(configPath, []byte(newContent), 0600); err != nil { //nolint:gosec // configPath is validated
 		return fmt.Errorf("failed to write config.yaml: %w", err)
@@ -545,32 +657,6 @@ func projectConfigPathFromLoadedState() string {
 	return configPath
 }
 
-// UserConfigYamlPath returns the platform-appropriate path for the
-// user-level config.yaml file. On Linux this is typically
-// ~/.config/bd/config.yaml; on macOS it checks ~/.config/bd/ first
-// (the documented cross-platform path) and falls back to
-// ~/Library/Application Support/bd/.
-func UserConfigYamlPath() string {
-	// Prefer ~/.config/bd/config.yaml — it's the documented path and
-	// works on all platforms after GH#3532.
-	if homeDir, err := os.UserHomeDir(); err == nil {
-		xdgPath := filepath.Join(homeDir, ".config", "bd", "config.yaml")
-		if _, err := os.Stat(xdgPath); err == nil {
-			return xdgPath
-		}
-		// If it doesn't exist yet, still prefer it as the recommendation
-		// unless the os.UserConfigDir() path already has a file.
-		if configDir, err := os.UserConfigDir(); err == nil {
-			osPath := filepath.Join(configDir, "bd", "config.yaml")
-			if _, err := os.Stat(osPath); err == nil {
-				return osPath
-			}
-		}
-		return xdgPath // recommend the cross-platform path
-	}
-	return "~/.config/bd/config.yaml" // fallback display string
-}
-
 func findProjectBeadsDir() string {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -595,8 +681,6 @@ func findProjectBeadsDir() string {
 // updateYamlKey updates a key in yaml content, handling commented-out keys.
 // If the key exists (commented or not), it updates it in place.
 // If the key doesn't exist, it appends it at the end.
-//
-//nolint:unparam // error return kept for future validation
 func updateYamlKey(content, key, value string) (string, error) {
 	if strings.Contains(key, ".") {
 		if updated, ok, err := updateNestedYamlKey(content, key, value); err != nil {
@@ -657,20 +741,39 @@ func updateNestedYamlKey(content, key, value string) (string, bool, error) {
 		return "", false, err
 	}
 	if len(root.Content) == 0 {
-		return "", false, nil
+		// An empty or comment-only document parses to no nodes at all: yaml.v3
+		// keeps no trace of its text, not even the comments. So there is nothing
+		// to nest into AND nothing to marshal back — fabricating a mapping here
+		// would emit the new key and silently delete everything else in the
+		// file, and `bd init`'s default template is exactly this shape, comments
+		// and nothing else. Append the rendered key to the text instead, which
+		// leaves the document byte for byte intact. Falling through to the flat
+		// writer is not an option either: that is what produced a key literally
+		// named "dolt.host", which GetStringFromDir — splitting on the dot and
+		// looking for a nested mapping — can never read back.
+		appended, err := appendNestedYamlKey(content, parts, value)
+		if err != nil {
+			return "", false, err
+		}
+		return appended, true, nil
 	}
 	mapping := root.Content[0]
 	if mapping.Kind != yaml.MappingNode {
-		return "", false, nil
+		return "", false, fmt.Errorf("cannot set %q: the top level of this config file is not a mapping", key)
 	}
 
-	if findMappingChild(mapping, key) != -1 {
-		return "", false, nil
+	// A flat key of this exact name is the unreadable shape, whether an older
+	// bd wrote it or the file arrived that way. Migrate it: drop the flat entry
+	// and write the value nested, so the round trip holds from here on. Only the
+	// key being written is touched — a dotted key this call does not own is
+	// someone else's and stays exactly as they wrote it.
+	if idx := findMappingChild(mapping, key); idx != -1 {
+		mapping.Content = append(mapping.Content[:idx], mapping.Content[idx+2:]...)
 	}
 
-	leaf, ok := findOrCreateNestedScalar(mapping, parts)
-	if !ok {
-		return "", false, nil
+	leaf, err := findOrCreateNestedScalar(mapping, parts)
+	if err != nil {
+		return "", false, err
 	}
 
 	leaf.Kind = yaml.ScalarNode
@@ -685,12 +788,9 @@ func updateNestedYamlKey(content, key, value string) (string, bool, error) {
 	return string(out), true, nil
 }
 
-func findOrCreateNestedScalar(mapping *yaml.Node, parts []string) (*yaml.Node, bool) {
+func findOrCreateNestedScalar(mapping *yaml.Node, parts []string) (*yaml.Node, error) {
 	current := mapping
 	for i, part := range parts {
-		if current.Kind != yaml.MappingNode {
-			return nil, false
-		}
 		idx := findMappingChild(current, part)
 		isLeaf := i == len(parts)-1
 		if idx == -1 {
@@ -703,21 +803,60 @@ func findOrCreateNestedScalar(mapping *yaml.Node, parts []string) (*yaml.Node, b
 			}
 			current.Content = append(current.Content, keyNode, valNode)
 			if isLeaf {
-				return valNode, true
+				return valNode, nil
 			}
 			current = valNode
 			continue
 		}
 		child := current.Content[idx+1]
 		if isLeaf {
-			return child, true
+			return child, nil
+		}
+		if child.Tag == "!!null" {
+			// A section with nothing left under it — `sync:` and no more, which
+			// is exactly what an unset leaves behind once it has commented the
+			// last leaf out. It holds no value to lose, so treat it as the empty
+			// mapping it looks like. Refusing here sent the caller to the flat
+			// writer, so set -> unset -> set put the unreadable `sync.remote:`
+			// spelling back into the file this whole fix exists to keep out.
+			child.Kind = yaml.MappingNode
+			child.Tag = "!!map"
+			child.Value = ""
+			child.Style = 0
 		}
 		if child.Kind != yaml.MappingNode {
-			return nil, false
+			return nil, fmt.Errorf("cannot set %q: %q already holds a value, so there is no section to nest under it",
+				strings.Join(parts, "."), strings.Join(parts[:i+1], "."))
 		}
 		current = child
 	}
-	return nil, false
+	// Unreachable: every path through the loop returns on the last part.
+	return nil, fmt.Errorf("cannot set %q: no key to write", strings.Join(parts, "."))
+}
+
+// appendNestedYamlKey renders just the key being written and appends it to the
+// document text. Used when the document has no nodes to walk, where the text is
+// the only copy of the file's contents that exists.
+func appendNestedYamlKey(content string, parts []string, value string) (string, error) {
+	node := &yaml.Node{Kind: yaml.ScalarNode, Style: scalarStyleFor(value), Value: value}
+	for i := len(parts) - 1; i >= 0; i-- {
+		node = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: parts[i]},
+			node,
+		}}
+	}
+	rendered, err := yaml.Marshal(node)
+	if err != nil {
+		return "", err
+	}
+
+	// Same spacing the flat writer uses: a blank line between whatever was
+	// already in the file and the key being added.
+	existing := strings.TrimRight(content, "\n")
+	if existing == "" {
+		return string(rendered), nil
+	}
+	return existing + "\n\n" + string(rendered), nil
 }
 
 func findMappingChild(mapping *yaml.Node, name string) int {
@@ -751,26 +890,109 @@ func scalarStyleFor(value string) yaml.Style {
 }
 
 func commentOutYamlKey(content, key string) string {
-	keyPattern := regexp.MustCompile(`^(\s*)` + regexp.QuoteMeta(key) + `\s*:`)
+	// The flat spelling first — a key literally named "sync.remote", which
+	// older files carry and which this function has always handled.
+	flatPattern := regexp.MustCompile(`^(\s*)` + regexp.QuoteMeta(key) + `\s*:`)
+	// And the nested one, which is what the writer produces. Missing this half
+	// made an unset silently do nothing once the writer started nesting: the
+	// value stayed live, so bd kept a setting the operator had asked it to
+	// forget. Unset is the other direction of the same round-trip property as
+	// set and get, and all three have to agree on the shape.
+	segments := strings.Split(key, ".")
 
 	var result []string
+	// depth tracks how many segments of the key have been matched so far, and
+	// indents holds the indentation each was found at, so a key is only
+	// commented out when it is nested under its OWN parents rather than under
+	// some other section that happens to share a leaf name.
+	depth := 0
+	var indents []int
+	// blockIndent is the indentation of the key that opened a literal or folded
+	// block scalar, or -1 outside one. Everything indented past that key is the
+	// value the user typed, not structure: `notes: |` with an indented
+	// `remote: keep-this` inside it is prose, and commenting it out edits their
+	// data. Matching by line has to skip those lines to stay honest.
+	blockIndent := -1
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	for scanner.Scan() {
 		line := scanner.Text()
-		if keyPattern.MatchString(line) {
-			matches := keyPattern.FindStringSubmatch(line)
-			indent := ""
-			if len(matches) > 1 {
-				indent = matches[1]
+
+		if blockIndent >= 0 {
+			if strings.TrimSpace(line) == "" || lineIndent(line) > blockIndent {
+				result = append(result, line)
+				continue
 			}
-			// Comment out the line, preserving indentation
-			result = append(result, indent+"# "+strings.TrimLeft(line, " \t"))
-		} else {
-			result = append(result, line)
+			blockIndent = -1
 		}
+		blockIndent = blockScalarIndent(line)
+
+		if matches := flatPattern.FindStringSubmatch(line); matches != nil {
+			result = append(result, matches[1]+"# "+strings.TrimLeft(line, " \t"))
+			continue
+		}
+
+		if len(segments) > 1 {
+			if name, indent, ok := yamlKeyOnLine(line); ok {
+				// Leaving a block: drop every segment matched at an indent at
+				// or deeper than this line's.
+				for depth > 0 && indent <= indents[depth-1] {
+					depth--
+					indents = indents[:depth]
+				}
+				if depth < len(segments) && name == segments[depth] {
+					if depth == len(segments)-1 {
+						result = append(result, strings.Repeat(" ", indent)+"# "+strings.TrimLeft(line, " \t"))
+						depth, indents = 0, nil
+						continue
+					}
+					indents = append(indents, indent)
+					depth++
+				}
+			}
+		}
+		result = append(result, line)
 	}
 
 	return strings.Join(result, "\n")
+}
+
+// blockScalarIndent reports the indentation of a key whose value is a literal
+// or folded block scalar (`notes: |`), or -1 when the line opens no block.
+func blockScalarIndent(line string) int {
+	_, indent, ok := yamlKeyOnLine(line)
+	if !ok {
+		return -1
+	}
+	_, rest, _ := strings.Cut(strings.TrimLeft(line, " \t"), ":")
+	rest = strings.TrimSpace(rest)
+	// "|" and ">" are only ever block indicators in value position; a plain
+	// scalar cannot start with either.
+	if rest == "" || (rest[0] != '|' && rest[0] != '>') {
+		return -1
+	}
+	return indent
+}
+
+func lineIndent(line string) int {
+	return len(line) - len(strings.TrimLeft(line, " \t"))
+}
+
+// yamlKeyOnLine reports the key a mapping line declares and its indentation.
+// Comments, list items and blank lines declare nothing.
+func yamlKeyOnLine(line string) (name string, indent int, ok bool) {
+	trimmed := strings.TrimLeft(line, " \t")
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "- ") {
+		return "", 0, false
+	}
+	key, _, found := strings.Cut(trimmed, ":")
+	if !found {
+		return "", 0, false
+	}
+	key = strings.TrimSpace(key)
+	if key == "" || strings.ContainsAny(key, " \t") {
+		return "", 0, false
+	}
+	return key, lineIndent(line), true
 }
 
 // formatYamlValue formats a value appropriately for YAML.

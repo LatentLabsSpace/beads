@@ -156,38 +156,32 @@ func runPruneSweep(t *testing.T, r cascadeRunner) pruneSweepOutcome {
 }
 
 // TestProxiedServerCascadeParity is the delete/prune/purge half of bd-04vav:
-// proxied `bd delete` ALWAYS cascades (--cascade is refused outright), so the
-// question the wheelhouse needs answered is not "is there a flag" but "does the
-// cascade reach anything classic mode would have left alone" — on the two
-// shapes it actually runs: wh-gate-sweep's gate purge, and the wisp-decay
-// close+purge pair.
+// since bd-paurh, proxied `bd delete` honors the classic cascade policy
+// (default refuse, --cascade sweep, --force orphan), so the question the
+// wheelhouse needs answered is "does a delete reach anything classic mode
+// would have left alone" — on the two shapes it actually runs:
+// wh-gate-sweep's gate purge, and the wisp-decay close+purge pair.
 //
-// Both scenarios are replayed against a classic embedded workspace and a
-// proxied one and the outcomes compared, so a divergence is reported as a
+// It was written while the answer was YES: proxied `bd delete` passed
+// Cascade:true unconditionally and refused the --cascade flag outright.
+// bd-x82so put both routes on issueops.Deleter with the flag the caller typed,
+// so every scenario here now pins ONE outcome for both modes.
+//
+// Both scenarios are still replayed against a classic embedded workspace and a
+// proxied one and the outcomes compared, so a re-divergence is reported as a
 // divergence rather than as one mode's test failing alone.
 func TestProxiedServerCascadeParity(t *testing.T) {
 	requireSharedProxiedServer(t)
 	t.Parallel()
 	bd := buildEmbeddedBD(t)
 
-	// KNOWN DIVERGENCE — DATA LOSS. Read this before changing anything below.
-	//
-	// Proxied `bd delete <gate> --force` deletes the bead the gate was gating,
-	// and everything downstream of THAT, because the proxied route passes
-	// Cascade:true unconditionally while classic cascades only under an explicit
-	// --cascade (which proxied refuses outright). On wh-gate-sweep's fixture the
-	// cascade is not a nuance: the sweep's third step is `bd delete <gate>
-	// --force`, and `bd gate create --blocks <target>` makes the gated bead a
-	// DEPENDENT of the gate, so on the proxied plane that step destroys the work
-	// it just unblocked. It is a cutover blocker for the shared-server
-	// constellation, not a wart.
-	//
-	// This subtest CHARACTERIZES the defect rather than asserting the fix: the
-	// classic half pins the behavior that is correct, and the proxied half pins
-	// exactly today's damage, so the suite stays honest and green while the
-	// divergence is open — and fails the moment the blast radius CHANGES, in
-	// either direction. Whoever fixes proxied delete's cascade flips
-	// wantProxied to match wantClassic and deletes this paragraph.
+	// This subtest is the acceptance test for bd-paurh: wh-gate-sweep's third
+	// step is `bd delete <gate> --force`, and `bd gate create --blocks <target>`
+	// makes the gated bead a DEPENDENT of the gate. Under the old proxied
+	// unconditional Cascade:true, that step destroyed the work it had just
+	// unblocked (plus everything downstream). With embedded parity, --force
+	// without --cascade orphans dependents: the gate goes, the gated target and
+	// its sibling stay — identical to classic.
 	t.Run("gate_delivery_ledger", func(t *testing.T) {
 		t.Parallel()
 		p := newSharedProxiedProject(t, bd, "cgp")
@@ -196,6 +190,8 @@ func TestProxiedServerCascadeParity(t *testing.T) {
 		classicDir, _, _ := bdInit(t, bd, "--prefix", "cgc")
 		classic := runGateDeliveryLedger(t, classicCascadeRunner(t, bd, classicDir))
 
+		// One expectation, both modes: an unforced-cascade delete of the gate
+		// removes the gate and leaves everything it was gating alive.
 		wantClassic := gateDeliveryLedgerOutcome{
 			gateGone: true, targetSurvives: true, siblingSurvives: true,
 		}
@@ -203,19 +199,15 @@ func TestProxiedServerCascadeParity(t *testing.T) {
 			t.Errorf("classic gate delivery-ledger delete: got %#v, want %#v", classic, wantClassic)
 		}
 
-		wantProxied := gateDeliveryLedgerOutcome{
-			gateGone: true, targetSurvives: false, siblingSurvives: false,
-		}
+		wantProxied := wantClassic
 		if proxied != wantProxied {
 			t.Errorf("proxied gate delivery-ledger delete: got %#v, want %#v "+
-				"(the known unconditional-cascade divergence; if this now matches classic, "+
-				"the defect is fixed — make wantProxied equal wantClassic)", proxied, wantProxied)
+				"(bd-paurh parity: `delete <gate> --force` must orphan the gated bead, "+
+				"never cascade into it)", proxied, wantProxied)
 		}
 		if proxied != classic {
-			t.Logf("KNOWN DIVERGENCE (bd-04vav): proxied delete cascades where classic does not.\n"+
-				"  proxied: %#v\n  classic: %#v\n"+
-				"  wh-gate-sweep's `bd delete <gate> --force` would destroy the gated bead "+
-				"and its dependents on the proxied plane.", proxied, classic)
+			t.Errorf("gate delivery ledger differs across modes:\n  proxied: %#v\n  classic: %#v",
+				proxied, classic)
 		}
 	})
 

@@ -44,37 +44,50 @@ func (c *readyClaimer) ClaimNext(ctx context.Context, request issueops.ClaimNext
 		return issueops.ClaimNextResult{}, err
 	}
 
-	var result issueops.ClaimNextResult
-	write := func() (*types.Issue, error) {
-		var claimed *types.Issue
-		err := c.store.runIssueOperationTxWithMessage(ctx, func(tx *sql.Tx) (storageissueops.ChangedTables, string, error) {
-			// Reset on every attempt: withRetryTx replays this body, and a
-			// replay that finds nothing ready must not leak the previous
-			// attempt's selection into the verify pass (which would verify an
-			// issue this call did not claim and fail loudly and falsely).
-			claimed = nil
-			attempt, tables, err := storageissueops.ExecuteClaimNext(ctx, tx, request.Actor, filter)
-			if err != nil {
-				return nil, "", err
-			}
-			result = attempt
-			if attempt.Claimed == nil {
-				return tables, "", nil
-			}
-			claimed = attempt.Claimed.Issue
-			// The message names the claimed issue because that is the one `bd
-			// dolt log` affordance callers actually grep, and it is what the
-			// store's own ClaimReadyIssue wrote before the claim moved here.
-			// Post-tx ordering caveat: a concurrent writer's commit can absorb
-			// this one (nothing-to-commit), in which case the claim appears
-			// under the OTHER writer's message — the grep is best-effort
-			// evidence of a claim, and its absence is not proof of failure.
-			return tables, storageissueops.ClaimNextCommitMessage(attempt.Claimed.ID), nil
-		})
-		return claimed, err
-	}
+	// Wake expired dated defers before selecting, so a bead whose snooze just
+	// ended is claimable the moment its date passes. Advisory, in a write tx
+	// of its own: a failed sweep must not cost the claim.
+	c.store.wakeExpiredDefers(ctx)
 
-	if _, err := c.store.verifiedReadyClaim(ctx, request.Actor, write); err != nil {
+	// The write and its verify sit under withCircuitWrite so terminal circuit
+	// success is recorded once at the boundary, only after verifiedReadyClaim
+	// returns nil — matching the store's own ClaimReadyIssue. write is defined
+	// inside the boundary so its runIssueOperationTxWithMessage captures the
+	// circuit-managed ctx and defers success to the boundary.
+	var result issueops.ClaimNextResult
+	err = c.store.withCircuitWrite(ctx, func(ctx context.Context) error {
+		write := func() (*types.Issue, error) {
+			var claimed *types.Issue
+			err := c.store.runIssueOperationTxWithMessage(ctx, func(tx *sql.Tx) (storageissueops.ChangedTables, string, error) {
+				// Reset on every attempt: withRetryTx replays this body, and a
+				// replay that finds nothing ready must not leak the previous
+				// attempt's selection into the verify pass (which would verify an
+				// issue this call did not claim and fail loudly and falsely).
+				claimed = nil
+				attempt, tables, err := storageissueops.ExecuteClaimNext(ctx, tx, request.Actor, filter)
+				if err != nil {
+					return nil, "", err
+				}
+				result = attempt
+				if attempt.Claimed == nil {
+					return tables, "", nil
+				}
+				claimed = attempt.Claimed.Issue
+				// The message names the claimed issue because that is the one `bd
+				// dolt log` affordance callers actually grep, and it is what the
+				// store's own ClaimReadyIssue wrote before the claim moved here.
+				// Post-tx ordering caveat: a concurrent writer's commit can absorb
+				// this one (nothing-to-commit), in which case the claim appears
+				// under the OTHER writer's message — the grep is best-effort
+				// evidence of a claim, and its absence is not proof of failure.
+				return tables, storageissueops.ClaimNextCommitMessage(attempt.Claimed.ID), nil
+			})
+			return claimed, err
+		}
+		_, verr := c.store.verifiedReadyClaim(ctx, request.Actor, write)
+		return verr
+	})
+	if err != nil {
 		return issueops.ClaimNextResult{}, err
 	}
 	return result, nil

@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -32,9 +33,22 @@ func newMockTxProvider(t *testing.T) (*doltSQLProvider, sqlmock.Sqlmock) {
 	return &doltSQLProvider{defaultBranch: defaultBranch, db: mockDB}, mock
 }
 
+// matchHasPending matches the dolt_status working-set check issued by
+// issueops.HasPendingChanges — the guard Commit runs before deciding whether
+// to mint a Dolt commit (#4348 re-port).
+const matchHasPending = `SELECT COUNT\(\*\) FROM dolt_status`
+
+// expectPendingChanges arms the HasPendingChanges guard to report a dirty
+// (count > 0) working set, letting Commit proceed to DOLT_COMMIT.
+func expectPendingChanges(mock sqlmock.Sqlmock, count int) {
+	mock.ExpectQuery(matchHasPending).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(count))
+}
+
 func TestDoltServerTxCommitFailureRollsBackBeforeRelease(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectPendingChanges(mock, 1)
 	mock.ExpectExec("DOLT_COMMIT").WillReturnError(errors.New("commit exploded"))
 	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -50,6 +64,7 @@ func TestDoltServerTxCommitFailureRollsBackBeforeRelease(t *testing.T) {
 func TestDoltServerTxCommitAndRollbackFailurePoisonsConn(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectPendingChanges(mock, 1)
 	mock.ExpectExec("DOLT_COMMIT").WillReturnError(errors.New("commit exploded"))
 	mock.ExpectExec("ROLLBACK").WillReturnError(errors.New("rollback exploded too"))
 
@@ -81,4 +96,192 @@ func TestBeginTxStartTransactionFailureReleasesConn(t *testing.T) {
 	_, err := p.BeginTx(context.Background())
 	require.ErrorContains(t, err, "no tx for you")
 	assert.Equal(t, 0, p.db.Stats().InUse, "pinned conn must not leak when START TRANSACTION fails")
+}
+
+// The tests below pin the #4348 re-port (original commit 3bd52c27f): Commit
+// gates DOLT_COMMIT('-Am') on issueops.HasPendingChanges so an idempotent
+// write that staged nothing (same-value REPLACE INTO metadata, 0-row CAS
+// re-claim, per-tick orchestrator reconciles) no longer issues a
+// guaranteed-empty commit that Dolt rejects server-side with "nothing to
+// commit" — flooding the server log and burning CPU. The skip path must still
+// CLOSE the open SQL transaction (plain COMMIT) before the pinned connection
+// is released; releasing with START TRANSACTION open would hand the next
+// borrower an implicit commit of orphaned state.
+
+// matchPlainCommit matches ONLY the plain SQL COMMIT (the ephemeral/skip
+// form), never CALL DOLT_COMMIT(...).
+const matchPlainCommit = `^COMMIT;$`
+
+func TestDoltServerTxCommitSkipsEmptyDoltCommit(t *testing.T) {
+	p, mock := newMockTxProvider(t)
+	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	// Clean working set: the guard reports nothing pending…
+	expectPendingChanges(mock, 0)
+	// …so the tx must close with a plain COMMIT. Deliberately NO expectation
+	// for DOLT_COMMIT: if the guard is reverted, the unconditional
+	// CALL DOLT_COMMIT('-Am', ?) fails to match matchPlainCommit and this test
+	// fails.
+	mock.ExpectExec(matchPlainCommit).WillReturnResult(sqlmock.NewResult(0, 0))
+
+	tx, err := p.BeginTx(context.Background())
+	require.NoError(t, err)
+
+	err = tx.Commit(context.Background(), "bd: noop")
+	require.NoError(t, err, "Commit on a clean working set must skip DOLT_COMMIT and succeed")
+	require.NoError(t, mock.ExpectationsWereMet(), "skip path must still close the SQL transaction with a plain COMMIT")
+	assert.Equal(t, 1, p.db.Stats().OpenConnections, "cleanly closed session may return to the pool")
+
+	err = tx.Commit(context.Background(), "bd: again")
+	require.ErrorContains(t, err, "already done", "skip path must still mark the tx done")
+}
+
+func TestDoltServerTxCommitIssuesDoltCommitWhenPending(t *testing.T) {
+	p, mock := newMockTxProvider(t)
+	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectPendingChanges(mock, 3)
+	mock.ExpectExec("DOLT_COMMIT").WithArgs("bd: real write").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	tx, err := p.BeginTx(context.Background())
+	require.NoError(t, err)
+
+	err = tx.Commit(context.Background(), "bd: real write")
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet(), "a dirty working set must be committed via DOLT_COMMIT")
+}
+
+func TestDoltServerTxCommitPendingCheckFailureRollsBackBeforeRelease(t *testing.T) {
+	p, mock := newMockTxProvider(t)
+	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(matchHasPending).WillReturnError(errors.New("status check exploded"))
+	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	tx, err := p.BeginTx(context.Background())
+	require.NoError(t, err)
+
+	err = tx.Commit(context.Background(), "msg")
+	require.ErrorContains(t, err, "status check exploded")
+	require.NoError(t, mock.ExpectationsWereMet(), "a failed pending check leaves the tx open and must ROLLBACK before release")
+	assert.Equal(t, 1, p.db.Stats().OpenConnections, "rolled-back session is clean and may return to the pool")
+}
+
+// TestDoltServerTxCommitPropagatesNothingToCommit pins the deliberate
+// deviation from the original #4348 commit: a residual "nothing to commit"
+// from DOLT_COMMIT itself is NOT swallowed here. RunTx already swallows it at
+// the call site (tx.go), and the uow layer lets it surface as a lost-update
+// signal (lostupdate_dolt_test.go) — swallowing it a layer down could mask a
+// silently lost write.
+func TestDoltServerTxCommitPropagatesNothingToCommit(t *testing.T) {
+	p, mock := newMockTxProvider(t)
+	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectPendingChanges(mock, 1)
+	mock.ExpectExec("DOLT_COMMIT").WillReturnError(errors.New("nothing to commit"))
+	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	tx, err := p.BeginTx(context.Background())
+	require.NoError(t, err)
+
+	err = tx.Commit(context.Background(), "msg")
+	require.ErrorContains(t, err, "nothing to commit", "the lost-update signal must surface to the caller, not be swallowed here")
+	require.NoError(t, mock.ExpectationsWereMet(), "the failed DOLT_COMMIT leaves the tx open and must ROLLBACK before release")
+}
+
+// TestDoltServerTxEphemeralCommitSkipsPendingCheck pins that the empty-message
+// EPHEMERAL form (bd-aq0ql) bypasses the HasPendingChanges guard entirely: it
+// already never mints a Dolt commit, so a dolt_status round-trip would be pure
+// overhead on the lease-heartbeat path.
+func TestDoltServerTxEphemeralCommitSkipsPendingCheck(t *testing.T) {
+	p, mock := newMockTxProvider(t)
+	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	// No dolt_status query expected: an added guard round-trip would surface
+	// as an unexpected query and fail Commit.
+	mock.ExpectExec(matchPlainCommit).WillReturnResult(sqlmock.NewResult(0, 0))
+
+	tx, err := p.BeginTx(context.Background())
+	require.NoError(t, err)
+
+	err = tx.Commit(context.Background(), "")
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestDoltServerTxCommitDefersDoltCommitUnderDeferredContext pins GH#4995:
+// dolt.auto-commit=batch/off marks the context with WithDeferredVersionCommit.
+// doltServerTx.Commit must blank the commit message, bypassing DOLT_COMMIT
+// and the HasPendingChanges dolt_status check, and executing a plain COMMIT
+// to persist writes into the working set without advancing Dolt history.
+func TestDoltServerTxCommitDefersDoltCommitUnderDeferredContext(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		deferred bool
+	}{
+		{name: "on (not deferred)", deferred: false},
+		{name: "batch or off (deferred)", deferred: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, mock := newMockTxProvider(t)
+			mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+			if tc.deferred {
+				// With deferred version commit (GH#4995), the non-empty message is blanked,
+				// skipping DOLT_COMMIT and executing plain COMMIT without status check.
+				mock.ExpectExec(matchPlainCommit).WillReturnResult(sqlmock.NewResult(0, 0))
+			} else {
+				expectPendingChanges(mock, 1)
+				mock.ExpectExec("DOLT_COMMIT").WithArgs("bd: real write").WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+
+			tx, err := p.BeginTx(context.Background())
+			require.NoError(t, err)
+
+			ctx := context.Background()
+			if tc.deferred {
+				ctx = issueops.WithDeferredVersionCommit(ctx)
+			}
+
+			err = tx.Commit(ctx, "bd: real write")
+			require.NoError(t, err)
+			require.NoError(t, mock.ExpectationsWereMet())
+			assert.Equal(t, 1, p.db.Stats().OpenConnections, "session must cleanly return to pool")
+		})
+	}
+}
+
+// TestDoltServerTxCommitHonorsImmediateVersionCommit pins the other half of the
+// GH#4995 policy: the proxied route applies the deferral ONCE, to the root
+// context, so the explicit commit points — the duals whose direct-route twin
+// calls transact and mints a Dolt commit whatever dolt.auto-commit says — opt
+// back out with issueops.WithImmediateVersionCommit. The caller's message must
+// then survive all the way to DOLT_COMMIT; blanking it would persist the rows
+// and record nothing, which is what `bd batch -m` must never do.
+func TestDoltServerTxCommitHonorsImmediateVersionCommit(t *testing.T) {
+	p, mock := newMockTxProvider(t)
+	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectPendingChanges(mock, 1)
+	mock.ExpectExec("DOLT_COMMIT").WithArgs("bd: batch 3 ops by tester").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	tx, err := p.BeginTx(context.Background())
+	require.NoError(t, err)
+
+	// Composed in the order the proxied CLI composes them: the route-wide
+	// deferral from the pre-run, then the exemption from the dual.
+	ctx := issueops.WithImmediateVersionCommit(issueops.WithDeferredVersionCommit(context.Background()))
+	require.NoError(t, tx.Commit(ctx, "bd: batch 3 ops by tester"))
+	require.NoError(t, mock.ExpectationsWereMet())
+	assert.Equal(t, 1, p.db.Stats().OpenConnections, "session must cleanly return to pool")
+}
+
+// TestDoltServerTxRunTxWithDeferredContextSkipsDoltCommit verifies that a complete
+// unit of work executed via RunTx under deferred version commit commits via plain
+// COMMIT and succeeds without advancing Dolt history (GH#4995).
+func TestDoltServerTxRunTxWithDeferredContextSkipsDoltCommit(t *testing.T) {
+	p, mock := newMockTxProvider(t)
+	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(matchPlainCommit).WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ctx := issueops.WithDeferredVersionCommit(context.Background())
+	err := RunTx(ctx, p, func(ctx context.Context, uw UnitOfWork) (string, error) {
+		return "bd: update GH#4995", nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+	assert.Equal(t, 1, p.db.Stats().OpenConnections)
 }

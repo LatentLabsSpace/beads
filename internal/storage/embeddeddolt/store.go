@@ -27,9 +27,11 @@ var _ storage.DoltStorage = (*EmbeddedDoltStore)(nil)
 var _ storage.StoreLocator = (*EmbeddedDoltStore)(nil)
 var _ storage.ActiveDatabaseSizer = (*EmbeddedDoltStore)(nil)
 var _ storage.GarbageCollector = (*EmbeddedDoltStore)(nil)
+var _ storage.FullGarbageCollector = (*EmbeddedDoltStore)(nil)
 var _ storage.Flattener = (*EmbeddedDoltStore)(nil)
 var _ storage.Compactor = (*EmbeddedDoltStore)(nil)
 var _ storage.SchemaMigrator = (*EmbeddedDoltStore)(nil)
+var _ storage.EventsJournalConfigurer = (*EmbeddedDoltStore)(nil)
 var _ storage.ExternalRefHistoryQuerier = (*EmbeddedDoltStore)(nil)
 
 // EmbeddedDoltStore implements storage.DoltStorage backed by the embedded Dolt engine.
@@ -47,6 +49,9 @@ type EmbeddedDoltStore struct {
 	branch        string
 	credentialKey []byte
 	closed        atomic.Bool
+	// eventsJournalEnabled activates the durable events journal for THIS store
+	// instance only (storage.EventsJournalConfigurer); never process-global.
+	eventsJournalEnabled atomic.Bool
 	// readOnly marks a store opened via OpenReadOnly or
 	// OpenForPreviewCommand: open-time mutations (CREATE DATABASE, schema
 	// migrations) were skipped and write transactions are refused
@@ -61,9 +66,11 @@ type EmbeddedDoltStore struct {
 }
 
 // openIntent classifies why a store is being opened. openStrict fails the
-// open on any pending-migration refusal; the other two intents relax both
-// the #4259 remote-migrate gate refusal and the #4566 dirty-table refusal,
-// each with its own warning text (see initSchema).
+// open on any pending-migration refusal; openReadOnlyCommand and
+// openWorkingSetReconcile relax both the #4259 remote-migrate gate refusal and
+// the #4566 dirty-table refusal, each with its own warning text (see
+// initSchema); openRemoteSync relaxes exactly one gate refusal and nothing
+// else.
 type openIntent int
 
 const (
@@ -81,7 +88,51 @@ const (
 	// touch, so failing the open here would deadlock the documented recovery
 	// (#4566). Used by OpenForWorkingSetReconcile.
 	openWorkingSetReconcile
+	// openRemoteSync is the same shape of deadlock break as
+	// openWorkingSetReconcile, for the #6575 data-behind gate refusal: that
+	// refusal's entire remedy is `bd dolt pull`, which itself opens the store
+	// and so hit the refusal that prescribed it — a fence with no gate. Unlike
+	// the two intents above it relaxes exactly ONE refusal and nothing else:
+	// only a gate error whose reason is data-behind
+	// (RemoteMigrateGateError.IsDataBehind). Every other gate refusal, the
+	// #4566 dirty-table guard, and the #5268 dependency re-key still fail this
+	// open exactly as they do a strict one — the pull is being let through its
+	// own precondition, not granted a general exemption. Used by
+	// OpenForRemoteSync.
+	openRemoteSync
 )
+
+// toleratesGateRefusal reports whether this open's intent may warn and
+// continue past a remote-migrate gate refusal (#4259/#5920/#6575) instead of
+// failing the open.
+//
+// openRemoteSync is deliberately conditional on the REASON rather than being
+// another blanket exemption: it exists only so `bd dolt pull` can execute the
+// #6575 data-behind refusal's own remedy, and widening it to every gate
+// refusal would quietly let a pull through a fork-skew or shared-store stop
+// that the pull cannot help with.
+func (s *EmbeddedDoltStore) toleratesGateRefusal(gateErr *schema.RemoteMigrateGateError) bool {
+	switch s.intent {
+	case openReadOnlyCommand, openWorkingSetReconcile:
+		return true
+	case openRemoteSync:
+		return gateErr.IsDataBehind()
+	default: // openStrict
+		return false
+	}
+}
+
+// toleratesMigrationRefusal reports whether this open's intent may warn and
+// continue past a MigrateUp refusal that is not the gate: the #4566
+// dirty-table guard and the #5268 dependency re-key conflict.
+//
+// openRemoteSync is absent on purpose. It is not listed as "not openStrict"
+// because that phrasing is what would have silently enrolled it: the remote-
+// sync exemption was granted for one gate reason, and a dirty working set or a
+// re-key conflict is a different refusal with a different recovery.
+func (s *EmbeddedDoltStore) toleratesMigrationRefusal() bool {
+	return s.intent == openReadOnlyCommand || s.intent == openWorkingSetReconcile
+}
 
 // errClosed is returned when a method is called after Close.
 var errClosed = errors.New("embeddeddolt: store is closed")
@@ -210,7 +261,69 @@ func openReadOnly(ctx context.Context, beadsDir, database, branch string, checkB
 // returns regardless of outcome.
 //
 // The database must already exist (created during initSchema).
-func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(tx *sql.Tx) error) (err error) {
+func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(tx *sql.Tx) error) error {
+	pending, err := s.commitConn(ctx, commit, fn)
+	if err != nil {
+		return err
+	}
+	logBlockedRecheckFailure(pending, s.recheckBlockedAfterCommit(ctx, pending))
+	return nil
+}
+
+// logBlockedRecheckFailure reports a post-commit recheck failure instead of
+// returning it. The write it followed is committed and durable, and every
+// caller of a store write reads an error as "the mutation did not land":
+// surfacing this one would make automated callers retry and double-apply.
+// What is left behind is the stale is_blocked flag `bd doctor` and
+// `bd recompute-blocked` repair, which is the state every write had before
+// the recheck existed.
+//
+// The sentence is issueops.BlockedRecheckFailureMessage, shared with the Dolt
+// store; only the sink differs. This store has no metrics registry, so unlike
+// the Dolt store's counter this line is the whole signal.
+func logBlockedRecheckFailure(pending issueops.BlockedRecheck, err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "warning: %s\n", issueops.BlockedRecheckFailureMessage(pending, err))
+}
+
+// recheckBlockedAfterCommit recomputes the blocked state of the dependents a
+// committed unblocking write recorded, on a fresh snapshot
+// (gastownhall/beads#6716).
+//
+// Embedded transactions serialize: commitConn opens a fresh OpenSQL handle
+// per transaction, and OpenSQL (open.go) waits in a backoff with no elapsed
+// time limit for the engine, so a second handle blocks until the first has
+// been cleaned up. Two transactions therefore never run against overlapping
+// snapshots in one process, and the skew of #6716 cannot occur here; no
+// embedded reproduction exists. The recheck is kept so the embedded store
+// honors the same contract as the server store — a stale row recorded by
+// one transaction is settled after its commit — and it runs only after the
+// first handle's cleanup, so it cannot deadlock on itself. It runs no SQL
+// when nothing was recorded.
+//
+// It runs on issueops.BlockedRecheckContext: the write it follows is durable,
+// so the repair must outlive that write's cancellation, and a recheck must
+// never start another recheck. The returned failure is for the caller to log,
+// never to return — see logBlockedRecheckFailure.
+func (s *EmbeddedDoltStore) recheckBlockedAfterCommit(ctx context.Context, pending issueops.BlockedRecheck) error {
+	if pending.Empty() || issueops.InBlockedRecheck(ctx) {
+		return nil
+	}
+	ctx, cancel := issueops.BlockedRecheckContext(ctx)
+	defer cancel()
+	if _, err := s.commitConn(ctx, true, func(tx *sql.Tx) error {
+		return issueops.RecomputeIsBlockedInTx(ctx, tx, pending.IssueIDs, pending.WispIDs)
+	}); err != nil {
+		return issueops.BlockedRecheckFailed(err)
+	}
+	return nil
+}
+
+// commitConn is withConn's transaction: it hands back the dependents the
+// transaction's unblocking writes recorded once it has committed.
+func (s *EmbeddedDoltStore) commitConn(ctx context.Context, commit bool, fn func(tx *sql.Tx) error) (pending issueops.BlockedRecheck, err error) {
 	if s.closed.Load() {
 		err = errClosed
 		return
@@ -227,8 +340,9 @@ func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(t
 		return
 	}
 
+	committed := false
 	defer func() {
-		err = errors.Join(err, cleanup())
+		err = joinTransactionCleanupError(err, cleanup(), committed)
 	}()
 
 	var tx *sql.Tx
@@ -237,6 +351,10 @@ func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(t
 		err = fmt.Errorf("embeddeddolt: begin tx: %w", err)
 		return
 	}
+	clearJournalScope := issueops.ScopeEventsJournalTransaction(tx, s.eventsJournalEnabled.Load())
+	defer clearJournalScope()
+	clearRecheckScope := issueops.ScopeBlockedRecheckTransaction(tx)
+	defer clearRecheckScope()
 
 	if fnErr := fn(tx); fnErr != nil {
 		err = errors.Join(fnErr, tx.Rollback())
@@ -248,11 +366,34 @@ func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(t
 		return
 	}
 
-	if cErr := tx.Commit(); cErr != nil {
-		err = fmt.Errorf("embeddeddolt: commit tx: %w", cErr)
+	if cErr := commitEmbeddedTx(tx); cErr != nil {
+		err = cErr
 		return
 	}
+	committed = true
+	pending = issueops.TakeBlockedRecheck(tx)
 	return
+}
+
+// SetEventsJournalEnabled activates the journal for this store instance only.
+func (s *EmbeddedDoltStore) SetEventsJournalEnabled(enabled bool) {
+	s.eventsJournalEnabled.Store(enabled)
+}
+
+// commitEmbeddedTx classifies an unconfirmed SQL commit response as
+// indeterminate: the engine may have applied it before the connection failed.
+func commitEmbeddedTx(tx *sql.Tx) error {
+	if err := tx.Commit(); err != nil {
+		return wrapCommitIndeterminate("embeddeddolt: commit tx", err)
+	}
+	return nil
+}
+
+func joinTransactionCleanupError(operationErr, cleanupErr error, committed bool) error {
+	if committed && cleanupErr != nil {
+		cleanupErr = wrapCommitIndeterminate("embeddeddolt: cleanup after SQL commit", cleanupErr)
+	}
+	return errors.Join(operationErr, cleanupErr)
 }
 
 func (s *EmbeddedDoltStore) ApplySchemaMigrations(ctx context.Context) (int, error) {
@@ -339,6 +480,13 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 		IsStrictAncestor: func(ctx context.Context, db schema.DBConn, ref string) (bool, error) {
 			return versioncontrolops.LocalIsStrictAncestorOf(ctx, db, ref)
 		},
+		// The raw counts the equal-version data-behind check needs
+		// (gastownhall/beads#6575): behind >= 1 whatever ahead is, plus
+		// which shape it is so the refusal names the pull the operator
+		// will actually get.
+		AheadBehind: func(ctx context.Context, db schema.DBConn, ref string) (int, int, error) {
+			return versioncontrolops.LocalAheadBehind(ctx, db, ref)
+		},
 		WorkingSetClean: func(ctx context.Context, db schema.DBConn) (bool, error) {
 			return versioncontrolops.WorkingSetClean(ctx, db)
 		},
@@ -358,7 +506,7 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 	}
 	if err := schema.CheckRemoteMigrateGateWithAdopt(ctx, conn, adopt); err != nil {
 		var gateErr *schema.RemoteMigrateGateError
-		if s.intent != openStrict && errors.As(err, &gateErr) {
+		if errors.As(err, &gateErr) && s.toleratesGateRefusal(gateErr) {
 			// The gate exists to stop in-place migration on a remote-backed,
 			// already-initialized database (#4259), not to block reads or a
 			// working-set commit. Warn and continue on the current schema;
@@ -372,20 +520,76 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 				"    • every other clone (another already migrated): bd bootstrap\n" +
 				"    • several machines: only ONE migrates; sync each other clone and run\n" +
 				"      bd dolt pull after the migrator pushes, before upgrading it\n"
+			// #6575: sharedGuidance is the blunt migrate-or-adopt block, and
+			// on the data-behind stop every bullet in it is measurably wrong
+			// — `bd migrate --force` applies the migration this stop exists
+			// to prevent, the `bd dolt push` after it is rejected
+			// non-fast-forward while the clone is still behind, and
+			// `bd bootstrap` no-ops against an existing workspace. The one
+			// command that moves the clone forward is `bd dolt pull`, and
+			// gateErr's own UserMessage is where that body lives, already
+			// branched for the fast-forward and diverged pulls. Printing
+			// %v (Error(), the one-line summary) and appending the bullets
+			// dropped it: a 1.1-era upgrader's first `bd list` and their
+			// `bd dolt commit` both land in the two arms below, so the first
+			// thing bd said to a data-behind clone was the wedge. Server
+			// mode's warnLenientOpenRefusal (dolt/store.go) has rendered
+			// UserMessage all along; these arms are the ones that lagged.
+			//
+			// The intent framing stays: the command in hand is still
+			// SUCCEEDING against the old schema, which UserMessage — written
+			// for the fatal refusal — does not say. So the mode line is
+			// appended to the data-behind body rather than replacing it.
+			body := "Warning: " + gateErr.Error() + "\n"
+			if gateErr.IsDataBehind() {
+				body = "Warning: " + gateErr.UserMessage()
+			}
 			switch s.intent {
-			case openWorkingSetReconcile:
+			case openRemoteSync:
+				// This is the refusal's own prescribed remedy running. It gets
+				// the short confirmation rather than the full data-behind body:
+				// toleratesGateRefusal admits only the data-behind stop here, so
+				// the operator has necessarily just been handed that body by the
+				// command this pull is unblocking, and re-printing "pull first"
+				// at the moment they are finally doing it is noise. What it must
+				// never do is name `bd migrate --force`.
 				fmt.Fprintf(os.Stderr,
 					"Warning: %[1]v\n"+
+						"  Remote-sync command: continuing on schema v%[2]d without migrating, so\n"+
+						"  this pull can bring in the commits this clone is behind on. Re-run the\n"+
+						"  command you were blocked on once it completes.\n",
+					gateErr, gateErr.CurrentVersion)
+			case openWorkingSetReconcile:
+				if gateErr.IsDataBehind() {
+					fmt.Fprintf(os.Stderr,
+						"%[1]s"+
+							"  Working-set reconcile command: continuing on schema v%[2]d without\n"+
+							"  migrating; the commit applies to the working set at the current\n"+
+							"  schema. It does not resolve the schema — the pull above is what does.\n",
+						body, gateErr.CurrentVersion)
+					break
+				}
+				fmt.Fprintf(os.Stderr,
+					"%[1]s"+
 						"  Working-set reconcile command: continuing on schema v%[2]d without\n"+
 						"  migrating; the commit applies to the working set at the current\n"+
 						"  schema."+sharedGuidance,
-					gateErr, gateErr.CurrentVersion)
+					body, gateErr.CurrentVersion)
 			default: // openReadOnlyCommand
+				if gateErr.IsDataBehind() {
+					fmt.Fprintf(os.Stderr,
+						"%[1]s"+
+							"  Read-only command: continuing on schema v%[2]d without migrating, so\n"+
+							"  this read succeeds against the old schema. Writes stay blocked until\n"+
+							"  this clone has pulled.\n",
+						body, gateErr.CurrentVersion)
+					break
+				}
 				fmt.Fprintf(os.Stderr,
-					"Warning: %[1]v\n"+
+					"%[1]s"+
 						"  Read-only command: continuing on schema v%[2]d without migrating.\n"+
 						"  Writes are blocked until the schema is reconciled."+sharedGuidance,
-					gateErr, gateErr.CurrentVersion)
+					body, gateErr.CurrentVersion)
 			}
 			return nil
 		}
@@ -396,7 +600,7 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 	// controls; schema.MigrateUpWithLock requires a sql-server session lock.
 	if _, err := schema.MigrateUp(ctx, conn); err != nil {
 		var dirtyErr *schema.DirtyTablesError
-		if s.intent != openStrict && errors.As(err, &dirtyErr) {
+		if s.toleratesMigrationRefusal() && errors.As(err, &dirtyErr) {
 			// The guard exists to keep dirty user data from being entangled
 			// with a migration, but its documented recovery - committing the
 			// working set - also opens the store and would otherwise hit
@@ -418,6 +622,22 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 						"  working set at the current schema, then re-run 'bd migrate'.\n",
 					dirtyErr)
 			}
+			return nil
+		}
+		var rekeyErr *schema.DependencyRekeyConflictError
+		if s.toleratesMigrationRefusal() && errors.As(err, &rekeyErr) {
+			// Same principle for the dependency re-key's refusal (#5268): it is
+			// a convergence repair, not a precondition for reading, and before
+			// that pass existed these clones opened fine. Bricking 'bd list' and
+			// 'bd show' on latent id corruption the user cannot even inspect
+			// without them would be a worse outcome than a stale primary key.
+			// Nothing is lost by continuing: the 0026 marker stays unrecorded,
+			// so the next open retries the repair.
+			fmt.Fprintf(os.Stderr,
+				"Warning: %v\n"+
+					"  Continuing without re-keying dependencies. Dependency ids stay as\n"+
+					"  they are until the conflict is resolved; run 'bd doctor' to inspect.\n",
+				rekeyErr)
 			return nil
 		}
 		return fmt.Errorf("embeddeddolt: migrate: %w", err)
@@ -449,7 +669,8 @@ func (s *EmbeddedDoltStore) GetIssueByExternalRef(ctx context.Context, externalR
 
 func (s *EmbeddedDoltStore) DeleteIssue(ctx context.Context, id string) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		return issueops.DeleteIssueInTx(ctx, tx, id)
+		// storage.DeleteIssue carries no actor, so the journal rows record none.
+		return issueops.DeleteIssueInTx(ctx, tx, id, "")
 	})
 }
 
@@ -599,6 +820,40 @@ func (s *EmbeddedDoltStore) EventsSince(ctx context.Context, cursor storage.Even
 	return result, err
 }
 
+// RecordProvenanceEvent appends a provenance event idempotently. inserted is
+// false when the deterministic id already existed. Append-only — no update path.
+func (s *EmbeddedDoltStore) RecordProvenanceEvent(ctx context.Context, ev types.ProvenanceEvent) (id string, inserted bool, err error) {
+	err = s.withConn(ctx, true, func(tx *sql.Tx) error {
+		var txErr error
+		id, inserted, txErr = issueops.RecordProvenanceEventInTx(ctx, tx, ev)
+		return txErr
+	})
+	if err != nil {
+		return "", false, err
+	}
+	return id, inserted, nil
+}
+
+func (s *EmbeddedDoltStore) GetProvenanceEvents(ctx context.Context, issueID, kindFilter string) ([]types.ProvenanceEvent, error) {
+	var result []types.ProvenanceEvent
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetProvenanceEventsInTx(ctx, tx, issueID, kindFilter)
+		return err
+	})
+	return result, err
+}
+
+func (s *EmbeddedDoltStore) GetProvenanceByRef(ctx context.Context, ref string) ([]types.ProvenanceEvent, error) {
+	var result []types.ProvenanceEvent
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetProvenanceByRefInTx(ctx, tx, ref)
+		return err
+	})
+	return result, err
+}
+
 // RunInTransaction is implemented in transaction.go.
 
 // Close decrements the reference count if this store was opened via Open (the
@@ -618,10 +873,19 @@ func (s *EmbeddedDoltStore) Close() error {
 	return nil
 }
 
-// DoltGC runs Dolt garbage collection to reclaim disk space.
+// DoltGC runs Dolt's default, generational garbage collection to reclaim disk
+// space.
 func (s *EmbeddedDoltStore) DoltGC(ctx context.Context) error {
 	return s.withMutatingDBConn(ctx, func(db versioncontrolops.DBConn) error {
 		return versioncontrolops.DoltGC(ctx, db)
+	})
+}
+
+// DoltGCFull runs a full Dolt garbage collection across all storage
+// generations.
+func (s *EmbeddedDoltStore) DoltGCFull(ctx context.Context) error {
+	return s.withMutatingDBConn(ctx, func(db versioncontrolops.DBConn) error {
+		return versioncontrolops.DoltGCFull(ctx, db)
 	})
 }
 
@@ -704,7 +968,6 @@ func (s *EmbeddedDoltStore) ImportJSONLData(
 
 		// Create all issues in the same transaction
 		if err := issueops.CreateIssuesInTx(ctx, tx, issues, actor, storage.BatchCreateOptions{
-			OrphanHandling:       storage.OrphanAllow,
 			SkipPrefixValidation: true,
 			// Defense-in-depth (GH#3955): the embedded fast-path is the primary
 			// auto-import route for 1.0+ users and is gated by the in-transaction
@@ -899,7 +1162,8 @@ func (s *EmbeddedDoltStore) DeleteIssues(ctx context.Context, ids []string, casc
 	var result *types.DeleteIssuesResult
 	err := s.withConn(ctx, !dryRun, func(tx *sql.Tx) error {
 		var err error
-		result, err = issueops.DeleteIssuesInTx(ctx, tx, ids, cascade, force, dryRun)
+		// storage.DeleteIssues carries no actor, so the journal rows record none.
+		result, err = issueops.DeleteIssuesInTx(ctx, tx, ids, cascade, force, dryRun, "")
 		return err
 	})
 	return result, err

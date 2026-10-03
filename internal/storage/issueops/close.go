@@ -381,6 +381,13 @@ func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, sess
 	if err != nil {
 		return nil, fmt.Errorf("recompute is_blocked after close for %s: %w", id, err)
 	}
+	NoteStatusChangeBlockedRecheck(tx, id, string(types.StatusClosed), affectedIssues, affectedWisps)
+
+	// Snapshot only after all derived blocked-state maintenance has completed.
+	// recordEvent gates the human audit event, never the journal.
+	if err := RecordEventInTx(ctx, tx, EventClose, id, actor); err != nil {
+		return nil, err
+	}
 
 	return &CloseResult{IsWisp: isWisp, IssueRowsChanged: !isWisp || recompute.IssueRowsChanged}, nil
 }

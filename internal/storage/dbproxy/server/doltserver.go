@@ -22,7 +22,6 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/steveyegge/beads/internal/doltserver"
-	"github.com/steveyegge/beads/internal/githooksenv"
 	"github.com/steveyegge/beads/internal/procid"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/identity"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/pidfile"
@@ -36,6 +35,13 @@ const (
 	PIDFileName  = "proxy-child.pid"
 	LockFileName = "proxy-child.lock"
 )
+
+// errBackendExited is the result of the supervising goroutine when the dolt
+// sql-server exits on its own with status 0 (for example dolt's graceful
+// shutdown on SIGTERM). errgroup cancels egCtx only for a non-nil result, and
+// Running reads egCtx, so without it a cleanly exited backend would be
+// reported as running forever.
+var errBackendExited = errors.New("dolt sql-server exited")
 
 const (
 	startReadyTimeout      = 30 * time.Second
@@ -255,11 +261,9 @@ func (s *DoltServer) Start(ctx context.Context) error {
 		cmd.Stderr = s.logFile
 	}
 
-	// GH#4272: like the directly-managed sql-server spawn in
-	// internal/doltserver, the proxied server executes CALL DOLT_PUSH/FETCH
-	// in-process, so templated git hooks must be disabled in its environment.
-	cmd.Env = append(os.Environ(), githooksenv.ParametersEnv+"="+
-		githooksenv.AppendParameter(os.Getenv(githooksenv.ParametersEnv), githooksenv.NoHooksParam))
+	// The proxied server runs CALL DOLT_PUSH/FETCH in-process; see
+	// doltserver.ServerSpawnEnv for the guards it needs (GH#4272).
+	cmd.Env = doltserver.ServerSpawnEnv()
 
 	if err := cmd.Start(); err != nil {
 		s.eg, s.egCtx, s.cancel = nil, nil, nil
@@ -306,7 +310,10 @@ func (s *DoltServer) Start(ctx context.Context) error {
 
 	eg.Go(func() error {
 		defer lock.Unlock()
-		return cmd.Wait()
+		if err := cmd.Wait(); err != nil {
+			return err
+		}
+		return errBackendExited
 	})
 
 	if err := s.waitReady(ctx); err != nil {
@@ -361,7 +368,7 @@ func (s *DoltServer) Stop(ctx context.Context) error {
 	if s.eg != nil {
 		waitErr = s.eg.Wait()
 		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) || errors.Is(waitErr, context.Canceled) {
+		if errors.As(waitErr, &exitErr) || errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, errBackendExited) {
 			waitErr = nil
 		}
 	}
